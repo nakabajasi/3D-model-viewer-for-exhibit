@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>environment</title>
+</head>
+<body>
+
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, dom, scene, renderer, libs, setStatus } = viewer;
+
+  // ----------------------------
+  // UI: mount target
+  // ----------------------------
+  const sec = dom.secEnvironment;
+  if (!sec){
+    console.warn("[environment] secEnvironment not found");
+    return;
+  }
+  const body = sec.querySelector(".secBody");
+  if (!body){
+    console.warn("[environment] .secBody not found");
+    return;
+  }
+
+  // UI差し替え
+  body.innerHTML = `
+    <div class="row">
+      <button id="btnEnvPick">HDRI import...</button>
+      <span class="hint" id="envName">(no hdri)</span>
+    </div>
+
+    <div class="field">
+      <label>Intensity</label>
+      <input id="envIntensity" type="range" min="0" max="1" step="0.01" value="1"
+        style="width:100%;" />
+    </div>
+
+    <div class="field">
+      <label>Rotation (Z)</label>
+      <input id="envRotZ" type="range" min="0" max="360" step="1" value="0"
+        style="width:100%;" />
+      <div class="hint" id="envRotZHint">0°</div>
+    </div>
+
+    <div class="field" style="display:flex;align-items:center;gap:10px;">
+      <input id="envHideBg" type="checkbox" />
+      <label for="envHideBg" style="margin:0;cursor:pointer;">Hide Background</label>
+    </div>
+
+    <div class="field">
+      <label>Background Color</label>
+      <input id="envBgColor" type="color" value="#202020" disabled />
+      <div class="hint">Hide Background が ON のときだけ有効（HDRIは光源として残ります）</div>
+    </div>
+
+    <div class="hint">
+      ・.hdr/.exr（HDRI）を読み込み、背景（360°）として表示します<br>
+      ・Rotation は垂直軸（Z）回り 0〜360° です<br>
+      ・Hide Background は「背景だけ」非表示（IBLは維持）です
+    </div>
+
+    <input id="envFileInput" type="file" accept=".hdr,.exr"
+      style="position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0" />
+  `;
+
+  const ui = {
+    btnPick: body.querySelector("#btnEnvPick"),
+    name: body.querySelector("#envName"),
+    intensity: body.querySelector("#envIntensity"),
+    rotZ: body.querySelector("#envRotZ"),
+    rotZHint: body.querySelector("#envRotZHint"),
+    hideBg: body.querySelector("#envHideBg"),
+    bgColor: body.querySelector("#envBgColor"),
+    file: body.querySelector("#envFileInput"),
+  };
+
+  // ----------------------------
+  // State
+  // ----------------------------
+  const state = {
+    intensity: 1.0,
+    rotZDeg: 0.0,
+    hideBackground: false,
+    bgColor: ui.bgColor.value || "#202020",
+    envTex: null,
+    lastObjectURL: null,
+  };
+
+  // ----------------------------
+  // Helpers
+  // ----------------------------
+  function revokeURL(){
+    if (state.lastObjectURL){
+      URL.revokeObjectURL(state.lastObjectURL);
+      state.lastObjectURL = null;
+    }
+  }
+
+  function setNameFromFile(file){
+    ui.name.textContent = file ? file.name : "(no hdri)";
+  }
+
+  function degToRad(d){ return d * Math.PI / 180; }
+
+  // ----------------------------
+  // Apply rotations
+  // Z-up fix: +90° around X
+  // Z-rotation slider: around Y (three.js equirect background uses Y for yaw)
+  // ----------------------------
+    
+  function applyRotations(){
+    const rotX = +Math.PI / 2;              // Z-up fix（HDRIを+90°X回転）
+    const rotY = 0;                         // ★ここは0固定
+    const rotZ = degToRad(state.rotZDeg);   // ★スライダーはZへ
+
+    if (scene.backgroundRotation && typeof scene.backgroundRotation.set === "function"){
+      scene.backgroundRotation.set(rotX, rotY, rotZ);
+    }
+
+    if (scene.environmentRotation && typeof scene.environmentRotation.set === "function"){
+      scene.environmentRotation.set(rotX, rotY, rotZ);
+    }
+  }
+
+
+  // HDRIを「光源（IBL）」として有効化しつつ、背景表示は state.hideBackground で切替
+  function applyEnvironment(tex){
+    if (!tex) return;
+
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+
+    // HDRは線形扱い（three r152+）
+    try{
+      tex.colorSpace = THREE.LinearSRGBColorSpace;
+    } catch (e){
+      // older three.js
+    }
+
+    // ★IBLは常に残す（Hide Backgroundでも残す）
+    scene.environment = tex;
+
+    // 背景は切替（HDRI or null or solid color）
+    applyBackgroundMode();
+
+    // 回転は background/environment 両方に適用
+    applyRotations();
+
+    // 暫定：強さを露出に反映（0.5〜2.0）
+    // environment intensity (r152+)
+    if ("environmentIntensity" in scene) scene.environmentIntensity = state.intensity;
+    if ("backgroundIntensity" in scene) scene.backgroundIntensity = state.intensity;
+  }
+
+  function applyBackgroundMode(){
+    // Hide Background ON → 背景は「単色」(Color) にする（ユーザー色）
+    // Hide Background OFF → 背景は HDRI を表示
+    if (state.hideBackground){
+      // 背景だけ単色。IBLは scene.environment に残っている。
+      scene.background = new THREE.Color(state.bgColor || "#202020");
+      ui.bgColor.disabled = false;
+    } else {
+      ui.bgColor.disabled = true;
+      if (state.envTex){
+        scene.background = state.envTex; // 360°背景表示
+      } else {
+        scene.background = null;
+      }
+    }
+  }
+
+  async function loadHDRIFromFile(file){
+    if (!file) return;
+
+    if (!libs?.RGBELoader){
+      alert("RGBELoader が見つかりません（index.html の橋渡しを確認してください）");
+      return;
+    }
+
+    // 既存のテクスチャを破棄
+    if (state.envTex){
+      state.envTex.dispose();
+      state.envTex = null;
+    }
+    revokeURL();
+
+    const url = URL.createObjectURL(file);
+    state.lastObjectURL = url;
+
+    const loader = new libs.RGBELoader();
+    const tex = await loader.loadAsync(url);
+
+    state.envTex = tex;
+    setNameFromFile(file);
+
+    applyEnvironment(tex);
+  }
+
+  // ----------------------------
+  // Events
+  // ----------------------------
+  ui.btnPick.addEventListener("click", ()=> ui.file.click());
+
+  ui.file.addEventListener("change", async ()=>{
+    const file = ui.file.files && ui.file.files[0];
+    ui.file.value = "";
+    if (!file) return;
+
+    try{
+      setStatus("loading hdri...");
+      await loadHDRIFromFile(file);
+      setStatus("ready (Pick or drop files)");
+    } catch (e){
+      console.error(e);
+      setStatus("ready (Pick or drop files)");
+      alert("HDRI読み込み失敗: " + (e?.message || e));
+    }
+  });
+
+  ui.intensity.addEventListener("input", ()=>{
+    state.intensity = Math.max(0, Math.min(1, parseFloat(ui.intensity.value) || 0));
+    if (state.envTex) applyEnvironment(state.envTex);
+  });
+
+  ui.rotZ.addEventListener("input", ()=>{
+    state.rotZDeg = Math.max(0, Math.min(360, parseFloat(ui.rotZ.value) || 0));
+    ui.rotZHint.textContent = `${Math.round(state.rotZDeg)}°`;
+    // HDRI未ロードでも回転は値として保持、ロード後に適用される
+    if (state.envTex){
+      applyRotations();
+      // 背景モードが HDRI の場合、rotation反映のために一度 mode適用
+      applyBackgroundMode();
+    }
+  });
+
+  ui.hideBg.addEventListener("change", ()=>{
+    state.hideBackground = !!ui.hideBg.checked;
+    applyBackgroundMode();
+  });
+
+  ui.bgColor.addEventListener("input", ()=>{
+    state.bgColor = ui.bgColor.value || "#202020";
+    if (state.hideBackground){
+      applyBackgroundMode();
+    }
+  });
+
+  // ----------------------------
+  // 初期値適用
+  // ----------------------------
+  state.intensity = parseFloat(ui.intensity.value) || 1.0;
+  state.rotZDeg = parseFloat(ui.rotZ.value) || 0.0;
+  state.hideBackground = !!ui.hideBg.checked;
+  state.bgColor = ui.bgColor.value || "#202020";
+  ui.rotZHint.textContent = `${Math.round(state.rotZDeg)}°`;
+  applyBackgroundMode();
+
+  console.log("[environment] backgroundRotation available?", !!scene.backgroundRotation,
+              "environmentRotation available?", !!scene.environmentRotation);
+}
+</script>
+
+</body>
+</html>

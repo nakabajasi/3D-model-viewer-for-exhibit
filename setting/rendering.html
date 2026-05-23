@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, dom, state, model, on, emit, setStatus } = viewer;
+
+  // Per mesh:
+  // {
+  //   originalMaterial,
+  //   originalNormal,
+  //   smoothNormal,
+  //   overrides:{unlit,matcap}
+  // }
+  const meshDB = new Map();
+
+  function disposeMaterialsArray(mats){
+    const arr = Array.isArray(mats) ? mats : [mats];
+    for (const m of arr){ if (m) m.dispose?.(); }
+  }
+
+  function disposeOverrides(){
+    for (const entry of meshDB.values()){
+      if (entry.overrides?.unlit)  disposeMaterialsArray(entry.overrides.unlit);
+      if (entry.overrides?.matcap) disposeMaterialsArray(entry.overrides.matcap);
+    }
+    meshDB.clear();
+  }
+
+  // Matcap (offline default)
+  const matcapTex = (() => {
+    const c = document.createElement("canvas");
+    c.width = 256; c.height = 256;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(0,0,c.width,c.height);
+
+    const grd = ctx.createRadialGradient(90, 80, 10, 128, 128, 140);
+    grd.addColorStop(0.0, "#f0f0f0");
+    grd.addColorStop(0.25, "#bdbdbd");
+    grd.addColorStop(0.55, "#6f6f6f");
+    grd.addColorStop(1.0, "#1a1a1a");
+    ctx.fillStyle = grd;
+    ctx.fillRect(0,0,c.width,c.height);
+
+    const grd2 = ctx.createRadialGradient(75, 70, 2, 75, 70, 65);
+    grd2.addColorStop(0.0, "rgba(255,255,255,0.95)");
+    grd2.addColorStop(1.0, "rgba(255,255,255,0)");
+    ctx.fillStyle = grd2;
+    ctx.fillRect(0,0,c.width,c.height);
+
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.needsUpdate = true;
+    return t;
+  })();
+
+  let currentMatcapTex = matcapTex;
+  let externalMatcapTex = null;
+  const matcapTexLoader = new THREE.TextureLoader();
+
+  function disposeExternalMatcap(){
+    if (externalMatcapTex){
+      externalMatcapTex.dispose?.();
+      externalMatcapTex = null;
+    }
+  }
+
+  function cloneNormalAttribute(attr){
+    if (!attr) return null;
+    return new THREE.BufferAttribute(attr.array.slice(0), attr.itemSize, attr.normalized);
+  }
+
+  function computeSmoothNormalsByPosition(geometry){
+    const pos = geometry?.getAttribute?.('position');
+    if (!pos) return null;
+
+    const normal = geometry.getAttribute('normal');
+    const itemCount = pos.count;
+    const sums = new Map();
+    const indexKeys = new Array(itemCount);
+    const precision = 1e5;
+
+    const fallback = new Float32Array(itemCount * 3);
+    if (normal && normal.count === itemCount){
+      fallback.set(normal.array);
+    } else {
+      const tempGeo = geometry.clone();
+      if (tempGeo.getAttribute('normal')) tempGeo.deleteAttribute('normal');
+      tempGeo.computeVertexNormals?.();
+      const tempNormal = tempGeo.getAttribute('normal');
+      if (tempNormal && tempNormal.count === itemCount) fallback.set(tempNormal.array);
+      tempGeo.dispose?.();
+    }
+
+    for (let i = 0; i < itemCount; i++){
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      const key = `${Math.round(x*precision)},${Math.round(y*precision)},${Math.round(z*precision)}`;
+      indexKeys[i] = key;
+      let s = sums.get(key);
+      if (!s){
+        s = { x:0, y:0, z:0 };
+        sums.set(key, s);
+      }
+      s.x += fallback[i*3 + 0];
+      s.y += fallback[i*3 + 1];
+      s.z += fallback[i*3 + 2];
+    }
+
+    const out = new Float32Array(itemCount * 3);
+    for (let i = 0; i < itemCount; i++){
+      const s = sums.get(indexKeys[i]);
+      let x = s.x, y = s.y, z = s.z;
+      const len = Math.hypot(x, y, z) || 1;
+      out[i*3 + 0] = x / len;
+      out[i*3 + 1] = y / len;
+      out[i*3 + 2] = z / len;
+    }
+    return new THREE.BufferAttribute(out, 3);
+  }
+
+  function collectOriginalMaterials(root){
+    meshDB.clear();
+    root.traverse(o=>{
+      if (!o.isMesh || !o.geometry) return;
+      const geom = o.geometry;
+      meshDB.set(o.uuid, {
+        originalMaterial: o.material,
+        originalNormal: cloneNormalAttribute(geom.getAttribute('normal')),
+        smoothNormal: null,
+        overrides: {},
+      });
+    });
+  }
+
+  function makeBasicFrom(sourceMat){
+    const m = new THREE.MeshBasicMaterial();
+    if (sourceMat?.color) m.color.copy(sourceMat.color);
+    if (sourceMat?.map) m.map = sourceMat.map;
+    if (sourceMat?.alphaMap) m.alphaMap = sourceMat.alphaMap;
+    if (sourceMat?.transparent != null) m.transparent = sourceMat.transparent;
+    if (sourceMat?.opacity != null) m.opacity = sourceMat.opacity;
+    if (sourceMat?.side != null) m.side = sourceMat.side;
+    if (sourceMat?.vertexColors != null) m.vertexColors = sourceMat.vertexColors;
+    m.needsUpdate = true;
+    return m;
+  }
+
+  function makeMatcapFrom(sourceMat){
+    const m = new THREE.MeshMatcapMaterial({ matcap: currentMatcapTex });
+    m.color.set(0xffffff);
+    m.map = null;
+    m.vertexColors = false;
+    if (sourceMat?.transparent != null) m.transparent = sourceMat.transparent;
+    if (sourceMat?.opacity != null) m.opacity = sourceMat.opacity;
+    if (sourceMat?.side != null) m.side = sourceMat.side;
+    m.needsUpdate = true;
+    return m;
+  }
+
+  function getOrCreateOverride(mesh, kind){
+    const entry = meshDB.get(mesh.uuid);
+    if (!entry) return null;
+    const original = entry.originalMaterial;
+    const ov = entry.overrides;
+
+    if (kind === "unlit"){
+      if (!ov.unlit){
+        ov.unlit = Array.isArray(original) ? original.map(m => makeBasicFrom(m)) : makeBasicFrom(original);
+      }
+      return ov.unlit;
+    }
+    if (kind === "matcap"){
+      if (!ov.matcap){
+        ov.matcap = Array.isArray(original) ? original.map(m => makeMatcapFrom(m)) : makeMatcapFrom(original);
+      }
+      return ov.matcap;
+    }
+    return null;
+  }
+
+  function invalidateMatcapOverrides(){
+    for (const entry of meshDB.values()){
+      if (entry.overrides?.matcap){
+        const mats = Array.isArray(entry.overrides.matcap) ? entry.overrides.matcap : [entry.overrides.matcap];
+        for (const m of mats){ m?.dispose?.(); }
+        entry.overrides.matcap = null;
+      }
+    }
+  }
+
+  function setMatcapUIState(){
+    const onMatcap = (state.rendererMode === "matcap");
+    dom.rowMatcap.style.display = onMatcap ? "flex" : "none";
+    const hasModel = !!model.currentModel;
+    dom.btnMatcapPick.disabled = !(onMatcap && hasModel);
+    dom.btnMatcapDefault.disabled = !(onMatcap && hasModel);
+  }
+
+  function setSmoothLitUIState(){
+    const hasModel = !!model.currentModel;
+    const canUse = hasModel && state.rendererMode !== 'matcap' && state.shadingMode === 'lit';
+    dom.chkSmoothLit.disabled = !canUse;
+  }
+
+  function applyNormalsForMesh(mesh, entry, useSmoothLit){
+    if (!mesh.geometry) return;
+    if (useSmoothLit){
+      if (!entry.smoothNormal) entry.smoothNormal = computeSmoothNormalsByPosition(mesh.geometry);
+      if (entry.smoothNormal){
+        mesh.geometry.setAttribute('normal', entry.smoothNormal);
+      } else if (entry.originalNormal) {
+        mesh.geometry.setAttribute('normal', entry.originalNormal);
+      } else {
+        mesh.geometry.deleteAttribute?.('normal');
+        mesh.geometry.computeVertexNormals?.();
+      }
+    } else if (entry.originalNormal) {
+      mesh.geometry.setAttribute('normal', entry.originalNormal);
+    } else {
+      mesh.geometry.deleteAttribute?.('normal');
+      mesh.geometry.computeVertexNormals?.();
+    }
+    mesh.geometry.attributes.normal.needsUpdate = true;
+  }
+
+  function applyDisplayMode(){
+    if (!model.currentModel) return;
+
+    const useMatcap = (state.rendererMode === "matcap");
+    const useUnlit  = (!useMatcap && state.shadingMode === "unlit");
+    const useSmoothLit = (!useMatcap && state.shadingMode === 'lit' && !!state.applySmoothNormalsInLit);
+
+    model.currentModel.traverse(o=>{
+      if (!o.isMesh) return;
+      const entry = meshDB.get(o.uuid);
+      if (!entry) return;
+
+      applyNormalsForMesh(o, entry, useSmoothLit);
+
+      if (useMatcap){ o.material = getOrCreateOverride(o, "matcap"); return; }
+      if (useUnlit){  o.material = getOrCreateOverride(o, "unlit");  return; }
+      o.material = entry.originalMaterial;
+    });
+
+    if (useMatcap){
+      dom.shadingNote.textContent = "Matcap選択中：ShadingはMatcap優先で固定扱い";
+      dom.selShading.disabled = true;
+    } else if (state.shadingMode === 'lit' && state.applySmoothNormalsInLit) {
+      dom.shadingNote.textContent = "Lit表示中のみ smoothing normals を適用（元法線は変更しません）";
+      dom.selShading.disabled = false;
+    } else {
+      dom.shadingNote.textContent = "";
+      dom.selShading.disabled = false;
+    }
+
+    setMatcapUIState();
+    setSmoothLitUIState();
+  }
+
+  function useDefaultMatcap(){
+    disposeExternalMatcap();
+    currentMatcapTex = matcapTex;
+    dom.matcapName.textContent = "(default)";
+    invalidateMatcapOverrides();
+    applyDisplayMode();
+  }
+
+  async function loadExternalMatcapFromFile(file){
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    try{
+      const tex = await matcapTexLoader.loadAsync(url);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.flipY = false;
+      tex.needsUpdate = true;
+
+      disposeExternalMatcap();
+      externalMatcapTex = tex;
+      currentMatcapTex = tex;
+
+      dom.matcapName.textContent = file.name;
+
+      invalidateMatcapOverrides();
+      applyDisplayMode();
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  dom.selRenderer.addEventListener("change", ()=>{
+    state.rendererMode = dom.selRenderer.value;
+    applyDisplayMode();
+    emit("state-changed", { key: "rendererMode", value: state.rendererMode });
+  });
+
+  dom.selShading.addEventListener("change", ()=>{
+    state.shadingMode = dom.selShading.value;
+    applyDisplayMode();
+    emit("state-changed", { key: "shadingMode", value: state.shadingMode });
+  });
+
+  dom.chkSmoothLit.addEventListener("change", ()=>{
+    state.applySmoothNormalsInLit = !!dom.chkSmoothLit.checked;
+    applyDisplayMode();
+    emit("state-changed", { key: "applySmoothNormalsInLit", value: state.applySmoothNormalsInLit });
+  });
+
+  dom.btnMatcapPick.addEventListener("click", ()=> dom.matcapInput.click());
+  dom.matcapInput.addEventListener("change", async (e)=>{
+    const f = (e.target.files && e.target.files[0]) ? e.target.files[0] : null;
+    e.target.value = "";
+    if (!f) return;
+    try{
+      await loadExternalMatcapFromFile(f);
+    } catch(err){
+      console.error(err);
+      alert("Matcap読み込み失敗: " + (err?.message || err));
+    }
+  });
+
+  dom.btnMatcapDefault.addEventListener("click", ()=> useDefaultMatcap());
+
+  on("model-loaded", ({ root })=>{
+    collectOriginalMaterials(root);
+    applyDisplayMode();
+    setMatcapUIState();
+    setSmoothLitUIState();
+  });
+
+  on("model-cleared", ()=>{
+    disposeOverrides();
+    disposeExternalMatcap();
+    currentMatcapTex = matcapTex;
+    dom.matcapName.textContent = "(default)";
+    setMatcapUIState();
+    setSmoothLitUIState();
+    dom.shadingNote.textContent = "";
+    dom.selShading.disabled = false;
+    dom.chkSmoothLit.checked = false;
+    dom.chkSmoothLit.disabled = true;
+  });
+
+  viewer.modules.rendering = {
+    applyDisplayMode,
+    setMatcapUIState,
+    setSmoothLitUIState,
+    disposeOverrides,
+    collectOriginalMaterials,
+    invalidateMatcapOverrides,
+    useDefaultMatcap,
+  };
+
+  setMatcapUIState();
+  setSmoothLitUIState();
+  setStatus("rendering ready");
+}
+</script>
+</body>
+</html>

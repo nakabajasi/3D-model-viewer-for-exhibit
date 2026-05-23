@@ -1,0 +1,867 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, dom, renderer, camera, controls, state, on, emit, setStatus } = viewer;
+
+  // -----------------------------
+  // state.camera
+  // -----------------------------
+  state.camera ??= {};
+  const camState = state.camera;
+
+  // persist fields
+  camState.fov ??= (typeof camera.fov === "number" ? camera.fov : 45);
+  camState.fly ??= false;
+
+  // -----------------------------
+  // Cameras (persp <-> ortho swap)
+  // -----------------------------
+  const persp = camera; // viewer's default camera
+  const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, persp.near, persp.far);
+  ortho.up.copy(persp.up);
+
+  // helper
+  const tmpV = new THREE.Vector3();
+
+// -----------------------------
+// Double-click to set orbit pivot (rotation center)
+// - Rotation center is stable unless user double-clicks a point on the model
+// - Other mouse operations are untouched
+// -----------------------------
+const _raycaster = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
+
+function _getPickRoot(){
+  // viewer implementations vary; try common roots without assuming structure.
+  // In this viewer, the loaded model is usually attached under viewer.model.currentPivot (see general.html).
+  const m = viewer?.model;
+  return (m && (m.currentPivot || m.currentModel || m.root)) || viewer.scene || null;
+}
+
+function _pickOnModel(clientX, clientY){
+  const canvas = renderer?.domElement;
+  const root = _getPickRoot();
+  if (!canvas || !root) return null;
+
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left) / Math.max(1, rect.width);
+  const y = (clientY - rect.top)  / Math.max(1, rect.height);
+
+  _ndc.set(x * 2 - 1, -(y * 2 - 1));
+  _raycaster.setFromCamera(_ndc, controls.object);
+
+  // recursive=true
+  const hits = _raycaster.intersectObject(root, true);
+  if (!hits || hits.length === 0) return null;
+
+  // choose nearest hit
+  return hits[0];
+}
+
+  function copyPose(src, dst){
+    dst.position.copy(src.position);
+    dst.quaternion.copy(src.quaternion);
+    dst.up.copy(src.up);
+    dst.near = src.near;
+    dst.far  = src.far;
+    dst.updateMatrixWorld(true);
+    dst.updateProjectionMatrix?.();
+  }
+
+  function getViewSize(){
+    // NOTE: --sideW can be "0px"; do NOT fallback via `|| 380`
+    const raw = getComputedStyle(document.documentElement).getPropertyValue("--sideW").trim();
+    let sideW = parseFloat(raw);
+    if (!Number.isFinite(sideW)) sideW = 380;
+    const viewW = Math.max(1, window.innerWidth - sideW);
+    const viewH = Math.max(1, window.innerHeight);
+    return { viewW, viewH };
+  }
+
+  function syncOrthoFrustum(){
+    const { viewW, viewH } = getViewSize();
+    const aspect = viewW / Math.max(1, viewH);
+
+    // keep "visual scale" somewhat consistent with perspective distance:
+    // use distance to target as a hint; if not available, default 5
+    const dist = (controls?.target && controls?.object)
+      ? controls.object.position.distanceTo(controls.target)
+      : 5;
+
+    const halfH = Math.max(0.001, dist * 0.5);
+    const halfW = halfH * aspect;
+
+    ortho.left   = -halfW;
+    ortho.right  =  halfW;
+    ortho.top    =  halfH;
+    ortho.bottom = -halfH;
+    ortho.updateProjectionMatrix();
+  }
+
+  function recenterTargetToOrigin(){
+    // This viewer's model pivot is at world origin (0,0,0)
+    const newTarget = tmpV.set(0, 0, 0);
+    const oldTarget = controls.target.clone();
+    const delta = newTarget.clone().sub(oldTarget);
+
+    // shift target
+    controls.target.copy(newTarget);
+
+    // keep view stable by shifting cameras too
+    persp.position.add(delta);
+    ortho.position.add(delta);
+
+    // if controls.object is one of them, ensure its matrix is updated
+    controls.object.updateMatrixWorld(true);
+    controls.update?.();
+  }
+
+  // track mode to detect "FOV解除" (ortho -> perspective)
+  let lastWasOrtho = controls.object?.isOrthographicCamera ? true : false;
+
+  function applyFov(){
+    const f = Number(camState.fov);
+    const fov = Number.isFinite(f) ? f : 45;
+
+    // UI reflect (if exists)
+    if (dom.camFov) dom.camFov.value = String(fov);
+
+    const wasOrtho = controls.object?.isOrthographicCamera ? true : false;
+
+    if (fov <= 0){
+      // ---- ORTHO MODE ----
+      copyPose(controls.object.isOrthographicCamera ? ortho : persp, ortho);
+      controls.object = ortho;
+      syncOrthoFrustum();
+      setStatus?.("camera: orthographic");
+    } else {
+      // ---- PERSPECTIVE MODE ----
+      copyPose(controls.object.isOrthographicCamera ? ortho : persp, persp);
+      persp.fov = Math.min(140, Math.max(1, fov));
+      persp.updateProjectionMatrix();
+      controls.object = persp;
+      setStatus?.("camera: perspective");
+    }
+
+    // FOV解除（ortho -> perspective）時に回転中心を必ず原点へ戻す
+    const nowIsOrtho = controls.object?.isOrthographicCamera ? true : false;
+    if (wasOrtho && !nowIsOrtho){
+      recenterTargetToOrigin();
+    }
+    lastWasOrtho = nowIsOrtho;
+
+    // If user changes FOV manually while Ortho Nav is active, cancel Ortho Nav and restore normal controls.
+    if (orthoNav.active && fov > 0){
+      _cancelOrthoNavAnim();
+      orthoNav.active = false;
+      orthoNav.prev = null;
+      orthoNav.base = null;
+      _applyOrthoNavMouseLock(false);
+      _applyOrthoNavUI();
+    }
+
+    emit?.("state-changed", { key: "camera", value: { fov: camState.fov, fly: camState.fly } });
+  }
+
+  
+  // -----------------------------
+  // Ortho View Presets (Front/Back/Right/Left/Top/Bottom)
+  // - Click a preset: switch to orthographic and fit model to view (0.5s)
+  // - While active: only wheel zoom is allowed (no rotate/pan/touch)
+  // - "Exit Ortho": return to previous view (0.5s)
+  // -----------------------------
+  const orthoNav = {
+    active: false,
+    prev: null,          // JSON-friendly snapshot
+    base: null,          // { planeHalfW, planeHalfH } (before aspect adjust)
+    anim: null,          // { raf }
+  };
+
+  function _getModelRootForFit(){
+    const m = viewer?.model;
+    return (m && (m.currentPivot || m.currentModel || m.root)) || viewer.scene || null;
+  }
+
+  function _snapshotView(){
+    const cam = controls.object;
+    const snap = {
+      fov: camState.fov,
+      fly: !!camState.fly,
+      isOrtho: !!cam?.isOrthographicCamera,
+      cam: {
+        pos: cam.position.toArray(),
+        quat: cam.quaternion.toArray(),
+        up: cam.up.toArray(),
+        near: cam.near,
+        far: cam.far,
+        // ortho frustum fields (if any)
+        left: cam.left ?? null,
+        right: cam.right ?? null,
+        top: cam.top ?? null,
+        bottom: cam.bottom ?? null,
+        zoom: cam.zoom ?? null,
+        // perspective
+        perspFov: cam.fov ?? null,
+      },
+      target: controls.target.toArray(),
+    };
+    return snap;
+  }
+
+  function _restoreSnapshotToOrtho(snap){
+    // restore onto `ortho` (we use it during animation)
+    ortho.position.fromArray(snap.cam.pos);
+    ortho.quaternion.fromArray(snap.cam.quat);
+    ortho.up.fromArray(snap.cam.up);
+
+    // When coming from perspective, ortho frustum may be null.
+    // Keep current frustum in that case.
+    if (Number.isFinite(snap.cam.left))   ortho.left   = snap.cam.left;
+    if (Number.isFinite(snap.cam.right))  ortho.right  = snap.cam.right;
+    if (Number.isFinite(snap.cam.top))    ortho.top    = snap.cam.top;
+    if (Number.isFinite(snap.cam.bottom)) ortho.bottom = snap.cam.bottom;
+    if (Number.isFinite(snap.cam.near))   ortho.near   = snap.cam.near;
+    if (Number.isFinite(snap.cam.far))    ortho.far    = snap.cam.far;
+    if (Number.isFinite(snap.cam.zoom))   ortho.zoom   = snap.cam.zoom;
+
+    ortho.updateMatrixWorld(true);
+    ortho.updateProjectionMatrix();
+
+    controls.target.fromArray(snap.target);
+    controls.update?.();
+  }
+
+  function _applyOrthoNavUI(){
+    // Button enable + hint
+    if (dom.btnOrthoExit) dom.btnOrthoExit.disabled = !orthoNav.active;
+    if (dom.orthoNavHint) dom.orthoNavHint.style.display = orthoNav.active ? "block" : "none";
+  }
+
+  function _applyOrthoNavMouseLock(on){
+    if (!controls) return;
+
+    if (on){
+      // Disable everything except wheel zoom
+      controls.enableRotate = false;
+      controls.enablePan = false;
+      controls.enableZoom = true;
+
+      if (controls.mouseButtons){
+        controls.mouseButtons.LEFT = undefined;
+        controls.mouseButtons.MIDDLE = undefined;
+        controls.mouseButtons.RIGHT = undefined;
+      }
+      if (controls.touches){
+        controls.touches.ONE = undefined;
+        controls.touches.TWO = undefined;
+      }
+    } else {
+      // Restore based on Fly state (uses savedOrbit)
+      applyFlyMouseLock();
+    }
+    controls.update?.();
+  }
+
+  function _getViewBasis(dir){
+    // Viewer convention (Z up):
+    // - Front: camera at -Y looking towards +Y
+    // - Back : camera at +Y looking towards -Y
+    // - Right: camera at +X looking towards -X
+    // - Left : camera at -X looking towards +X
+    // - Top  : camera at +Z looking towards -Z, screen-up = +Y
+    // - Bottom: camera at -Z looking towards +Z, screen-up = +Y
+    const forward = new THREE.Vector3();
+    const up = new THREE.Vector3();
+
+    switch (dir){
+      case "front":  forward.set(0,  1, 0); up.set(0, 0, 1); break;
+      case "back":   forward.set(0, -1, 0); up.set(0, 0, 1); break;
+      case "right":  forward.set(-1, 0, 0); up.set(0, 0, 1); break;
+      case "left":   forward.set( 1, 0, 0); up.set(0, 0, 1); break;
+      case "top":    forward.set(0, 0, -1); up.set(0, 1, 0); break;
+      case "bottom": forward.set(0, 0,  1); up.set(0, 1, 0); break;
+      default:       forward.set(0,  1, 0); up.set(0, 0, 1); break;
+    }
+
+    // right = up x forward
+    const right = new THREE.Vector3().crossVectors(up, forward).normalize();
+    const orthoUp = new THREE.Vector3().crossVectors(forward, right).normalize(); // re-orthonormalize
+
+    return { forward, right, up: orthoUp };
+  }
+
+
+  function _computeFitForDir(dir){
+    const root = _getModelRootForFit();
+    if (!root) return null;
+
+    // world AABB
+    const box = new THREE.Box3().setFromObject(root);
+    if (!box || box.isEmpty()) return null;
+
+    const center = box.getCenter(new THREE.Vector3());
+
+    // corners
+    const min = box.min, max = box.max;
+    const corners = [
+      new THREE.Vector3(min.x, min.y, min.z),
+      new THREE.Vector3(min.x, min.y, max.z),
+      new THREE.Vector3(min.x, max.y, min.z),
+      new THREE.Vector3(min.x, max.y, max.z),
+      new THREE.Vector3(max.x, min.y, min.z),
+      new THREE.Vector3(max.x, min.y, max.z),
+      new THREE.Vector3(max.x, max.y, min.z),
+      new THREE.Vector3(max.x, max.y, max.z),
+    ];
+
+    const { viewW, viewH } = getViewSize();
+    const aspect = viewW / Math.max(1, viewH);
+
+    const { forward, right, up } = _getViewBasis(dir);
+
+    // project extents in view plane
+    let rMin = +Infinity, rMax = -Infinity;
+    let uMin = +Infinity, uMax = -Infinity;
+    let fMin = +Infinity, fMax = -Infinity;
+
+    for (const p of corners){
+      const v = p.clone().sub(center);
+      const r = v.dot(right);
+      const u = v.dot(up);
+      const f = v.dot(forward);
+      if (r < rMin) rMin = r;
+      if (r > rMax) rMax = r;
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (f < fMin) fMin = f;
+      if (f > fMax) fMax = f;
+    }
+
+    const width = Math.max(1e-6, rMax - rMin);
+    const height = Math.max(1e-6, uMax - uMin);
+    const depth = Math.max(1e-6, fMax - fMin);
+
+    // margin so it "fills" without clipping
+    const MARGIN = 1.08;
+    const planeHalfW = (width  * 0.5) * MARGIN;
+    const planeHalfH = (height * 0.5) * MARGIN;
+
+    // aspect adjust
+    let halfW = planeHalfW;
+    let halfH = planeHalfH;
+    if ((halfW / Math.max(1e-6, halfH)) < aspect){
+      halfW = halfH * aspect;
+    } else {
+      halfH = halfW / aspect;
+    }
+
+    // camera distance (only for near/far safety; ortho scale doesn't depend on distance)
+    const depthHalf = depth * 0.5;
+    const dist = depthHalf + Math.max(halfW, halfH) + 0.5; // keep some buffer
+
+    const pos = center.clone().sub(forward.clone().multiplyScalar(dist));
+
+    // Build target orientation
+    const camTmp = new THREE.Object3D();
+    camTmp.position.copy(pos);
+    camTmp.up.copy(up);
+    camTmp.lookAt(center);
+    const quat = camTmp.quaternion.clone();
+
+    // near/far around the target
+    const NEAR_PAD = 2.0;
+    const FAR_PAD  = 10.0;
+    const near = Math.max(0.001, dist - (depthHalf + NEAR_PAD) * 2.0);
+    const far  = Math.max(near + 0.01, dist + (depthHalf + FAR_PAD) * 2.0);
+
+    return {
+      target: center,
+      pos,
+      quat,
+      up,
+      frustum: { left: -halfW, right: halfW, top: halfH, bottom: -halfH, near, far },
+      base: { planeHalfW, planeHalfH }, // for resize re-fit
+    };
+  }
+
+  function _updateOrthoNavFrustumFromBase(){
+    if (!orthoNav.active || !orthoNav.base) return;
+    const { viewW, viewH } = getViewSize();
+    const aspect = viewW / Math.max(1, viewH);
+
+    let halfW = orthoNav.base.planeHalfW;
+    let halfH = orthoNav.base.planeHalfH;
+
+    if ((halfW / Math.max(1e-6, halfH)) < aspect){
+      halfW = halfH * aspect;
+    } else {
+      halfH = halfW / aspect;
+    }
+
+    ortho.left = -halfW;
+    ortho.right = halfW;
+    ortho.top = halfH;
+    ortho.bottom = -halfH;
+    ortho.updateProjectionMatrix();
+  }
+
+  function _cancelOrthoNavAnim(){
+    if (orthoNav.anim?.raf) cancelAnimationFrame(orthoNav.anim.raf);
+    orthoNav.anim = null;
+  }
+
+  function _easeInOut(t){
+    return (t < 0.5) ? (2*t*t) : (1 - Math.pow(-2*t + 2, 2) / 2);
+  }
+
+  function _animateOrthoTo(end, ms=500, onDone){
+    _cancelOrthoNavAnim();
+
+    const cam = ortho; // we animate on the shared ortho camera
+    const startPos = cam.position.clone();
+    const startQuat = cam.quaternion.clone();
+    const startUp = cam.up.clone();
+    const startTarget = controls.target.clone();
+
+    const startF = { left: cam.left, right: cam.right, top: cam.top, bottom: cam.bottom, near: cam.near, far: cam.far };
+    const endF = end.frustum;
+
+    const t0 = performance.now();
+    orthoNav.anim = { raf: 0 };
+
+    const step = (now)=>{
+      const t = Math.min(1, (now - t0) / ms);
+      const k = _easeInOut(t);
+
+      cam.position.lerpVectors(startPos, end.pos, k);
+      cam.quaternion.copy(startQuat).slerp(end.quat, k);
+      cam.up.lerpVectors(startUp, end.up, k);
+
+      controls.target.lerpVectors(startTarget, end.target, k);
+
+      cam.left   = startF.left   + (endF.left   - startF.left)   * k;
+      cam.right  = startF.right  + (endF.right  - startF.right)  * k;
+      cam.top    = startF.top    + (endF.top    - startF.top)    * k;
+      cam.bottom = startF.bottom + (endF.bottom - startF.bottom) * k;
+      cam.near   = startF.near   + (endF.near   - startF.near)   * k;
+      cam.far    = startF.far    + (endF.far    - startF.far)    * k;
+
+      cam.updateMatrixWorld(true);
+      cam.updateProjectionMatrix();
+      controls.update?.();
+
+      if (t < 1){
+        orthoNav.anim.raf = requestAnimationFrame(step);
+      } else {
+        orthoNav.anim = null;
+        onDone?.();
+      }
+    };
+
+    orthoNav.anim.raf = requestAnimationFrame(step);
+  }
+
+  function setOrthoViewPreset(dir){
+    // If already in Fly, temporarily disable during Ortho (store in prev snapshot)
+    if (!orthoNav.active){
+      orthoNav.prev = _snapshotView();
+    }
+
+    // ensure we are in orthographic camera (FOV=0)
+    camState.fov = 0;
+    camState.fly = false; // disable fly while ortho nav is active
+    applyFov();           // swaps controls.object -> ortho
+
+    // disable pivot double-click animation during ortho nav (handled in handler)
+    orthoNav.active = true;
+
+    // Copy current pose into ortho (avoid jump), then compute end and animate
+    copyPose(persp, ortho); // safe even if currently ortho; it is a pose copy only
+    ortho.zoom = 1;
+    ortho.updateProjectionMatrix();
+
+    const fit = _computeFitForDir(dir);
+    if (!fit){
+      setStatus?.("camera: ortho (no model to fit)");
+      _applyOrthoNavMouseLock(true);
+      _applyOrthoNavUI();
+      return;
+    }
+
+    orthoNav.base = fit.base;
+
+    // Start from current view pose (already copied), animate to fit
+    _applyOrthoNavMouseLock(true);
+    _applyOrthoNavUI();
+
+    _animateOrthoTo(fit, 500, ()=>{
+      // ensure exact values
+      ortho.position.copy(fit.pos);
+      ortho.quaternion.copy(fit.quat);
+      ortho.up.copy(fit.up);
+      controls.target.copy(fit.target);
+      ortho.left = fit.frustum.left;
+      ortho.right = fit.frustum.right;
+      ortho.top = fit.frustum.top;
+      ortho.bottom = fit.frustum.bottom;
+      ortho.near = fit.frustum.near;
+      ortho.far = fit.frustum.far;
+      ortho.updateMatrixWorld(true);
+      ortho.updateProjectionMatrix();
+      controls.update?.();
+      setStatus?.(`camera: ortho ${dir}`);
+    });
+  }
+
+  function exitOrthoViewPreset(){
+    if (!orthoNav.active || !orthoNav.prev) return;
+
+    // animate ortho camera back to previous pose (even if previous was perspective)
+    const prev = orthoNav.prev;
+
+    const end = {
+      target: new THREE.Vector3().fromArray(prev.target),
+      pos: new THREE.Vector3().fromArray(prev.cam.pos),
+      quat: new THREE.Quaternion().fromArray(prev.cam.quat),
+      up: new THREE.Vector3().fromArray(prev.cam.up),
+      frustum: {
+        left: Number.isFinite(prev.cam.left) ? prev.cam.left : ortho.left,
+        right: Number.isFinite(prev.cam.right) ? prev.cam.right : ortho.right,
+        top: Number.isFinite(prev.cam.top) ? prev.cam.top : ortho.top,
+        bottom: Number.isFinite(prev.cam.bottom) ? prev.cam.bottom : ortho.bottom,
+        near: Number.isFinite(prev.cam.near) ? prev.cam.near : ortho.near,
+        far: Number.isFinite(prev.cam.far) ? prev.cam.far : ortho.far,
+      }
+    };
+
+    _animateOrthoTo(end, 500, ()=>{
+      // Switch back to previous mode & values
+      ortho.zoom = 1;
+      ortho.updateProjectionMatrix();
+
+      camState.fov = prev.fov;
+      camState.fly = !!prev.fly;
+
+      orthoNav.active = false;
+      orthoNav.base = null;
+
+      applyFov();          // returns to perspective if prev.fov>0 (or stays ortho if 0)
+      applyFlyMouseLock(); // restore mouse settings (and fly if it was on)
+
+      _applyOrthoNavUI();
+      setStatus?.("camera: restored");
+    });
+  }
+
+// -----------------------------
+  // UI wiring (FOV + Fly)
+  // -----------------------------
+  function ensureFlyUI(){
+    if (dom.camFly) return;
+
+    const fovEl = dom.camFov;
+    const body = fovEl?.closest?.(".secBody");
+    if (!body) return;
+
+    // add fly UI under existing hint
+    const flyWrap = document.createElement("div");
+    flyWrap.innerHTML = `
+      <div class="field" style="margin-top:10px">
+        <label style="display:flex; align-items:center; gap:10px; user-select:none;">
+          <input id="camFly" type="checkbox" style="transform:scale(1.05)">
+          <span>Flythrough（WASD / 矢印）</span>
+        </label>
+      </div>
+      <div class="hint" id="camFlyHint">
+        Fly中は「左クリック+ドラッグ（回転）」と「右ドラッグ（平行移動）」のみ有効。ホイール/中ドラッグ等は無効。WASD/矢印で移動（一定速度）。<br>左ダブルクリックで、その点を回転中心に変更（Fly中は無効）。
+      </div>
+    `;
+    body.appendChild(flyWrap);
+
+    dom.camFly = flyWrap.querySelector("#camFly");
+    dom.camFly.checked = !!camState.fly;
+
+    dom.camFly.addEventListener("change", ()=>{
+      camState.fly = !!dom.camFly.checked;
+      applyFlyMouseLock();
+      emit?.("state-changed", { key: "camera", value: { fov: camState.fov, fly: camState.fly } });
+    });
+  }
+
+  // existing FOV input
+  if (dom.camFov){
+    dom.camFov.addEventListener("input", ()=>{
+      const v = Number(dom.camFov.value);
+      camState.fov = Number.isFinite(v) ? v : camState.fov;
+      applyFov();
+    });
+  }
+
+  ensureFlyUI();
+
+  // Ortho preset buttons (camera view)
+  const bindOrthoBtn = (btn, dir)=>{
+    if (!btn) return;
+    btn.addEventListener("click", (e)=>{
+      e.preventDefault();
+      setOrthoViewPreset(dir);
+    });
+  };
+  bindOrthoBtn(dom.btnViewFront,  "front");
+  bindOrthoBtn(dom.btnViewBack,   "back");
+  bindOrthoBtn(dom.btnViewRight,  "right");
+  bindOrthoBtn(dom.btnViewLeft,   "left");
+  bindOrthoBtn(dom.btnViewTop,    "top");
+  bindOrthoBtn(dom.btnViewBottom, "bottom");
+
+  if (dom.btnOrthoExit){
+    dom.btnOrthoExit.addEventListener("click", (e)=>{
+      e.preventDefault();
+      exitOrthoViewPreset();
+    });
+  }
+  _applyOrthoNavUI();
+
+
+  // keep ortho frustum in sync
+  window.addEventListener("resize", ()=>{
+    if (controls.object?.isOrthographicCamera){
+      if (orthoNav.active) _updateOrthoNavFrustumFromBase();
+      else syncOrthoFrustum();
+    }
+  });
+
+// -----------------------------
+  // Flythrough: disable all mouse/touch ops except LEFT-drag (rotate)
+  // -----------------------------
+  const savedOrbit = {
+    enableRotate: !!controls.enableRotate,
+    enablePan: !!controls.enablePan,
+    enableZoom: !!controls.enableZoom,
+    mouseButtons: { ...(controls.mouseButtons || {}) },
+    touches: { ...(controls.touches || {}) },
+  };
+
+  function applyFlyMouseLock(){
+    if (!controls) return;
+
+    if (camState.fly){
+      // allow LEFT-drag rotate + RIGHT-drag pan (zoom disabled)
+      controls.enableRotate = true;
+      controls.enablePan = true;
+      controls.enableZoom = false;
+
+      if (controls.mouseButtons){
+        controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+        controls.mouseButtons.MIDDLE = undefined; // disable
+        controls.mouseButtons.RIGHT  = THREE.MOUSE.PAN; // re-enable
+      }
+      if (controls.touches){
+        controls.touches.ONE = THREE.TOUCH.ROTATE;
+        controls.touches.TWO = undefined; // disable pinch/pan
+      }
+    } else {
+      // restore defaults
+      controls.enableRotate = savedOrbit.enableRotate;
+      controls.enablePan = savedOrbit.enablePan;
+      controls.enableZoom = savedOrbit.enableZoom;
+
+      if (controls.mouseButtons){
+        controls.mouseButtons.LEFT   = savedOrbit.mouseButtons.LEFT;
+        controls.mouseButtons.MIDDLE = savedOrbit.mouseButtons.MIDDLE;
+        controls.mouseButtons.RIGHT  = savedOrbit.mouseButtons.RIGHT;
+      }
+      if (controls.touches){
+        controls.touches.ONE = savedOrbit.touches.ONE;
+        controls.touches.TWO = savedOrbit.touches.TWO;
+      }
+    }
+
+    controls.update?.();
+  }
+
+  // prevent browser/system actions (context menu, wheel scroll) while Fly is ON
+  const canvasEl = renderer?.domElement;
+  if (canvasEl){
+// Double-click on model to change orbit pivot (rotation center)
+// + Smoothly move the view so the picked point comes to screen center (1s)
+// NOTE: other mouse operations are untouched
+let _pivotAnim = null;
+function _easeInOutQuad(t){
+  return (t < 0.5) ? (2*t*t) : (1 - Math.pow(-2*t + 2, 2) / 2);
+}
+function _animateCenterTo(point, ms=1000){
+  const cam = controls.object;
+  const startTarget = controls.target.clone();
+  const startPos = cam.position.clone();
+
+  // End target is the picked point
+  const endTarget = point.clone();
+
+  // Shrink camera-target distance to 60% (i.e., 40% closer) while keeping the same view direction
+  const rel = startPos.clone().sub(startTarget);
+  const endPos = endTarget.clone().addScaledVector(rel, 0.6);
+
+  // cancel previous animation
+  if (_pivotAnim && _pivotAnim.raf) cancelAnimationFrame(_pivotAnim.raf);
+
+  const t0 = performance.now();
+  _pivotAnim = { raf: 0 };
+
+  const step = (now)=>{
+    const t = Math.min(1, (now - t0) / ms);
+    const k = _easeInOutQuad(t);
+
+    controls.target.lerpVectors(startTarget, endTarget, k);
+    cam.position.lerpVectors(startPos, endPos, k);
+
+    cam.updateMatrixWorld(true);
+    controls.update?.();
+
+    if (cam.isOrthographicCamera){
+      syncOrthoFrustum();
+    }
+
+    if (t < 1){
+      _pivotAnim.raf = requestAnimationFrame(step);
+    } else {
+      _pivotAnim = null;
+    }
+  };
+
+  _pivotAnim.raf = requestAnimationFrame(step);
+}
+
+
+canvasEl.addEventListener("dblclick", (e)=>{
+  // Disabled during Flythrough / Ortho Nav
+  if (camState.fly || orthoNav.active) return;
+  const hit = _pickOnModel(e.clientX, e.clientY);
+  if (!hit) return;
+
+  // Smoothly move target to the picked point (becomes screen center)
+  // and bring the camera 40% closer (distance becomes 60%).
+  _animateCenterTo(hit.point, 1000);
+
+  emit?.("state-changed", { key: "camera", value: { fov: camState.fov, fly: camState.fly } });
+}, { passive:true });
+
+    canvasEl.addEventListener("contextmenu", (e)=>{
+      if (camState.fly){ e.preventDefault(); }
+    }, { passive:false });
+
+    canvasEl.addEventListener("wheel", (e)=>{
+      if (camState.fly){ e.preventDefault(); }
+    }, { passive:false, capture:true });
+  }
+
+// -----------------------------
+  // Flythrough (keyboard move) + Orbit mouse concurrently
+  // -----------------------------
+  const keys = {
+    forward:false, back:false, left:false, right:false, up:false, down:false,
+  };
+
+  const SPEED = 2.0; // units/sec (constant)
+  const WORLD_UP = new THREE.Vector3(0, 0, 1);
+  const fwd = new THREE.Vector3();
+  const right = new THREE.Vector3();
+  const up = new THREE.Vector3();
+  const move = new THREE.Vector3();
+
+  function isTypingTarget(e){
+    const t = e?.target;
+    if (!t) return false;
+    const tag = (t.tagName || "").toLowerCase();
+    return tag === "input" || tag === "textarea" || tag === "select" || t.isContentEditable;
+  }
+
+  function setKey(e, down){
+    if (!camState.fly) return;
+    if (isTypingTarget(e)) return;
+
+    const k = (e.key || "").toLowerCase();
+    switch (k){
+      case "w": keys.forward = down; break;
+      case "s": keys.back    = down; break;
+      case "a": keys.left    = down; break;
+      case "d": keys.right   = down; break;
+      case "arrowup":    keys.forward = down; break;
+      case "arrowdown":  keys.back    = down; break;
+      case "arrowleft":  keys.left    = down; break;
+      case "arrowright": keys.right   = down; break;
+      case " ": keys.up = down; break;
+      case "shift": keys.down = down; break;
+      default: return;
+    }
+    e.preventDefault();
+  }
+
+  window.addEventListener("keydown", (e)=> setKey(e, true), { passive:false });
+  window.addEventListener("keyup",   (e)=> setKey(e, false), { passive:false });
+
+  let lastT = performance.now();
+  function tick(t){
+    const dt = Math.min(0.05, Math.max(0.0, (t - lastT) / 1000));
+    lastT = t;
+
+    if (camState.fly){
+      // let OrbitControls keep working; we only translate camera+target
+      const cam = controls.object;
+
+      const any = keys.forward || keys.back || keys.left || keys.right || keys.up || keys.down;
+      if (any){
+        cam.getWorldDirection(fwd);          // forward (world)
+        fwd.normalize();
+        right.crossVectors(fwd, WORLD_UP).normalize();
+        up.crossVectors(right, fwd).normalize(); // corrected up
+
+        move.set(0,0,0);
+        if (keys.forward) move.add(fwd);
+        if (keys.back)    move.sub(fwd);
+        if (keys.right)   move.add(right);
+        if (keys.left)    move.sub(right);
+        if (keys.up)      move.add(WORLD_UP);
+        if (keys.down)    move.sub(WORLD_UP);
+
+        if (move.lengthSq() > 1e-12){
+          move.normalize().multiplyScalar(SPEED * dt);
+
+          cam.position.add(move);
+          controls.target.add(move);
+
+          cam.updateMatrixWorld(true);
+          controls.update?.();
+
+          if (cam.isOrthographicCamera){
+            syncOrthoFrustum();
+          }
+        }
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // -----------------------------
+  // expose
+  // -----------------------------
+  viewer.modules.camera = {
+    applyFov,
+    recenterTargetToOrigin,
+    setOrthoViewPreset,
+    exitOrthoViewPreset,
+    captureSection: ()=> ({ fov: camState.fov, fly: camState.fly }),
+  };
+
+  // init
+  applyFov();
+  applyFlyMouseLock();
+}
+</script>
+</body>
+</html>

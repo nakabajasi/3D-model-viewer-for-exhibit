@@ -1,0 +1,1667 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, dom, setStatus } = viewer;
+
+  const state = {
+    enabled: false,
+    mode: "aruco", // "aruco" | "mouse" | "hand"
+    showPreview: false,
+    loadingLib: false,
+    libReady: false,
+    video: null,
+    stream: null,
+    cameraMode: null,
+    canvas: null,
+    ctx: null,
+    detector: null,
+    posit: null,
+    markerSizeMm: 60,
+    smoothing: 0.18,
+    rafId: 0,
+    lastQ: null,
+    status: "idle",
+    _positWidth: null,
+    _positMarkerSize: null,
+    // ロスト耐性
+    lostCount: 0,
+    lostMax: 30,          // ≒1秒@30fps — 面切替・持ち替え時の猶予
+    // 前処理
+    contrast: 1.0,        // まず1.0で検出状況を確認
+    // 辞書
+    dictionary: "ARUCO_MIP_36h12",
+    // ヒステリシス（主タグ切替の安定化）
+    lastPrimaryId: -1,
+    hysteresisRatio: 1.3,
+    // 軸補正
+    // calibInvQ は init 後に設定。manualTweak は手動微調整用
+    manualTweak: new THREE.Quaternion(),
+    lastRawCubeQ: null,
+    scanMode: false,       // ID調査モード
+    // エリアスケール
+    scaleEnabled: true,
+    scaleMin: 0.2,         // area最小時のスケール（20%）
+    scaleMax: 0.8,         // area最大時のスケール（80%）
+    areaRatioMin: 0.02,    // スケール最小に対応するarea比（カメラ全体の2%）
+    areaRatioMax: 0.08,    // スケール最小に対応するarea比（カメラ全体の8%）
+    lastScale: null,       // スムージング用
+    // カメラ固定
+    savedView: null,      // { pos, target, fov, controlsEnabled }
+    debugEnabled: false,
+    debugInfo: "",
+    overlayCanvas: null,
+    overlayCtx: null,
+    hand: {
+      loading: false,
+      ready: false,
+      active: false,
+      visionMod: null,
+      landmarker: null,
+      lastVideoTime: -1,
+      smoothing: 0.75,
+      filtered: null,
+      debug: false,
+      // 向き追跡
+      calibZ: null,       // 初回検出時のZ角度
+      calibX: null,       // 初回検出時のX角度
+      calibModelQ: null,  // hand開始時のモデル姿勢
+      lastHandQ: null,    // スムージング用
+      lastHandScale: null,// スケール用
+      calibHandSize: null,// 初回の手サイズ
+    },
+  };
+
+  const SCRIPT_URLS = [
+    new URL("./libs/aruco/cv.js", location.href).href,
+    new URL("./libs/aruco/aruco.js", location.href).href,
+    new URL("./libs/aruco/svd.js", location.href).href,
+    new URL("./libs/aruco/posit1.js", location.href).href,
+  ];
+
+  const HAND_VISION_BUNDLE_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+  const HAND_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+  const HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+  // -------------------------------------------------------
+  // 面オフセットテーブル（6面）
+  // キューブ本体座標系 → 各面のマーカーローカル座標系 への回転
+  //
+  // キューブ本体座標系（ID 0 基準で定義）:
+  //   Z+ = 上（ID 0 法線）, Y+ = 奥（ID 0 上辺）, X+ = 右
+  //
+  // マーカーローカル座標系:
+  //   Z = 法線（外向き）, Y = 上辺方向, X = Y×Z（右辺方向）
+  //
+  // 貼り方ルール:
+  //   ID 0 = 上面    （上辺を奥に）     法線=Z+  上辺=Y+
+  //   ID 1 = 右側面  （上辺を天井に）   法線=X+  上辺=Z+
+  //   ID 2 = 正面    （上辺を天井に）   法線=-Y  上辺=Z+
+  //   ID 3 = 左側面  （上辺を天井に）   法線=-X  上辺=Z+
+  //   ID 4 = 背面    （上辺を天井に）   法線=Y+  上辺=Z+
+  //   ID 5 = 下面    （上辺を手前に）   法線=-Z  上辺=-Y
+  //
+  // rawQ = cubeBodyQ × faceOffset[id]
+  // ∴ cubeBodyQ = rawQ × faceOffsetInv[id]
+  // -------------------------------------------------------
+  const FACE_OFFSETS = {
+    0: new THREE.Quaternion(),                                                                          // identity
+    1: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 1, 1).normalize(), 2*Math.PI/3),    // 120° around (1,1,1)
+    2: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2),                // X +90°
+    3: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,-1,-1).normalize(), 2*Math.PI/3),    // 120° around (1,-1,-1)
+    4: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 1).normalize(), Math.PI),        // 180° around (0,1,1)
+    5: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI),                    // X 180°
+  };
+  const FACE_OFFSET_INVS = {};
+  for (const [id, q] of Object.entries(FACE_OFFSETS)){
+    FACE_OFFSET_INVS[id] = q.clone().invert();
+  }
+
+  // キャリブレーション用
+  state.calibInvQ = null;    // inv(calibration時のcubeQ)
+  state.calibModelQ = null;  // calibration時のモデル姿勢
+
+  function generalApi(){
+    return viewer.modules.general || null;
+  }
+
+  function setLocalStatus(msg){
+    state.status = msg;
+    if (els.status) els.status.textContent = `status: ${msg}`;
+  }
+
+  function setDebugInfo(msg){
+    state.debugInfo = msg || "";
+    if (els.debugInfo) els.debugInfo.textContent = state.debugInfo ? `debug: ${state.debugInfo}` : "debug: -";
+  }
+
+  function makeRow(){
+    const d = document.createElement("div");
+    d.className = "row";
+    d.style.gap = "8px";
+    d.style.flexWrap = "wrap";
+    d.style.alignItems = "center";
+    return d;
+  }
+
+  function makeField(labelText, inputEl){
+    const wrap = document.createElement("div");
+    wrap.className = "field";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    wrap.appendChild(label);
+    wrap.appendChild(inputEl);
+    return wrap;
+  }
+
+  function makeNumberInput(value, min, max, step){
+    const el = document.createElement("input");
+    el.type = "number";
+    if (min != null) el.min = String(min);
+    if (max != null) el.max = String(max);
+    if (step != null) el.step = String(step);
+    el.value = String(value);
+    el.style.width = "100%";
+    el.style.background = "#0f0f0f";
+    el.style.border = "1px solid var(--line)";
+    el.style.color = "var(--fg)";
+    el.style.padding = "8px 10px";
+    el.style.borderRadius = "10px";
+    el.style.fontSize = "12px";
+    el.style.outline = "none";
+    return el;
+  }
+
+  function makeRangeNumberPair(value, min, max, step){
+    const wrap = document.createElement("div");
+    wrap.style.display = "grid";
+    wrap.style.gridTemplateColumns = "1fr 72px";
+    wrap.style.gap = "8px";
+    wrap.style.alignItems = "center";
+
+    const range = document.createElement("input");
+    range.type = "range";
+    range.min = String(min);
+    range.max = String(max);
+    range.step = String(step);
+    range.value = String(value);
+
+    const num = makeNumberInput(value, min, max, step);
+    wrap.append(range, num);
+    return { wrap, range, num };
+  }
+
+  function createSection(){
+    const section = document.createElement("div");
+    section.className = "section";
+
+    const secHead = document.createElement("div");
+    secHead.className = "secHead";
+    const secTitle = document.createElement("span");
+    secTitle.textContent = "Cube Tracking / Non-contact Rotate";
+    secHead.appendChild(secTitle);
+
+    const secBody = document.createElement("div");
+    secBody.className = "secBody";
+
+    const enable = document.createElement("input");
+    enable.type = "checkbox";
+    const enableLabel = document.createElement("label");
+    enableLabel.className = "pill";
+    enableLabel.append(enable, document.createTextNode(" Enable"));
+
+    const preview = document.createElement("input");
+    preview.type = "checkbox";
+    const previewLabel = document.createElement("label");
+    previewLabel.className = "pill";
+    previewLabel.append(preview, document.createTextNode(" Show camera preview"));
+
+    const row1 = makeRow();
+    row1.style.gap = "10px";
+    row1.append(enableLabel, previewLabel);
+
+    const mode = document.createElement("select");
+    mode.style.width = "100%";
+    mode.style.background = "#0f0f0f";
+    mode.style.border = "1px solid var(--line)";
+    mode.style.color = "var(--fg)";
+    mode.style.padding = "8px 10px";
+    mode.style.borderRadius = "10px";
+    mode.style.fontSize = "12px";
+    mode.style.outline = "none";
+    mode.innerHTML = `
+      <option value="aruco">Aruco</option>
+      <option value="mouse">Mouse</option>
+      <option value="hand">Hand (Webcam)</option>
+    `;
+
+    const markerSize = makeNumberInput(60, 10, 100, 1);
+    const smooth = document.createElement("input");
+    smooth.type = "range";
+    smooth.min = "0";
+    smooth.max = "0.95";
+    smooth.step = "0.01";
+    smooth.value = "0.18";
+
+    const dict = document.createElement("select");
+    dict.style.width = "100%";
+    dict.style.background = "#0f0f0f";
+    dict.style.border = "1px solid var(--line)";
+    dict.style.color = "var(--fg)";
+    dict.style.padding = "8px 10px";
+    dict.style.borderRadius = "10px";
+    dict.style.fontSize = "12px";
+    dict.style.outline = "none";
+    dict.innerHTML = `
+      <option value="ARUCO_MIP_36h12" selected>ARUCO_MIP_36h12</option>
+      <option value="ARUCO">ARUCO (5×5 元祖)</option>
+      <option value="APRILTAG_16h5">APRILTAG_16h5</option>
+      <option value="APRILTAG_36h11">APRILTAG_36h11</option>
+    `;
+
+    const contrast = makeRangeNumberPair(1.0, 1.0, 3.0, 0.1);
+    const holdMax = makeRangeNumberPair(30, 0, 60, 1);
+
+    // エリアスケール
+    const scaleEnable = document.createElement("input");
+    scaleEnable.type = "checkbox";
+    scaleEnable.checked = true;
+    const scaleEnableLabel = document.createElement("label");
+    scaleEnableLabel.className = "pill";
+    scaleEnableLabel.append(scaleEnable, document.createTextNode(" Area → Scale"));
+
+    const scaleMin = makeRangeNumberPair(0.2, 0.05, 1.0, 0.05);
+    const scaleMax = makeRangeNumberPair(0.8, 0.2, 3.0, 0.05);
+
+    const sx = makeRangeNumberPair(4.0, 0.5, 10, 0.1);
+    const sy = makeRangeNumberPair(3.0, 0.5, 10, 0.1);
+
+    // キャリブレーション & 軸補正UI
+    const axisBox = document.createElement("div");
+    axisBox.style.cssText = "display:flex; flex-direction:column; gap:6px;";
+
+    const calibBtn = document.createElement("button");
+    calibBtn.textContent = "Calibrate (ID0上 + ID2正面で押す)";
+    calibBtn.style.cssText = "padding:8px 12px; font-weight:700; border-color:#4a8;";
+
+    const calibHint = document.createElement("div");
+    calibHint.className = "hint";
+    calibHint.innerHTML = '事前に Basic で回転を合わせて「回転をセット」を押してください。<br>Aruco Enable でカメラ正面固定。ID 0 上 + ID 2 正面で Calibrate。';
+
+    const axisLabel = document.createElement("div");
+    axisLabel.className = "hint";
+    axisLabel.style.marginTop = "6px";
+    axisLabel.textContent = "手動微調整（±90°ずつ）";
+    const axisRow = document.createElement("div");
+    axisRow.style.cssText = "display:flex; gap:4px; flex-wrap:wrap; align-items:center;";
+    const makeAxisBtn = (label) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.style.cssText = "min-width:40px; padding:6px 8px; font-size:11px;";
+      return b;
+    };
+    const btnXp = makeAxisBtn("X+90");
+    const btnXm = makeAxisBtn("X-90");
+    const btnYp = makeAxisBtn("Y+90");
+    const btnYm = makeAxisBtn("Y-90");
+    const btnZp = makeAxisBtn("Z+90");
+    const btnZm = makeAxisBtn("Z-90");
+    const btnAxisReset = makeAxisBtn("Clear");
+    btnAxisReset.style.borderColor = "#c44";
+    axisRow.append(btnXp, btnXm, btnYp, btnYm, btnZp, btnZm, btnAxisReset);
+    axisBox.append(calibBtn, calibHint, axisLabel, axisRow);
+
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.innerHTML = [
+      'Aruco 6面対応: ID 0=上 / 1=右 / 2=正面 / 3=左 / 4=背面 / 5=下。',
+      '① Basic で回転を合わせて「回転をセット」',
+      '② Aruco Enable → Calibrate → キューブで操作',
+    ].join('<br>');
+
+    const status = document.createElement("div");
+    status.className = "hint";
+    status.textContent = "status: idle";
+
+    // === Debug セクション（末尾） ===
+    const debugBox = document.createElement("div");
+    debugBox.style.cssText = "display:flex; flex-direction:column; gap:6px; border-top:1px solid var(--line); padding-top:8px; margin-top:4px;";
+
+    const debug = document.createElement("input");
+    debug.type = "checkbox";
+    const debugEnableLabel = document.createElement("label");
+    debugEnableLabel.className = "pill";
+    debugEnableLabel.append(debug, document.createTextNode(" Debug"));
+
+    const scanBtn = document.createElement("button");
+    scanBtn.textContent = "Scan IDs (面のID調査)";
+    scanBtn.style.cssText = "padding:8px 12px; font-size:12px; border-color:#ca4; display:none;";
+
+    const debugOverlay = document.createElement("input");
+    debugOverlay.type = "checkbox";
+    const debugOverlayLabel = document.createElement("label");
+    debugOverlayLabel.className = "pill";
+    debugOverlayLabel.style.display = "none";
+    debugOverlayLabel.append(debugOverlay, document.createTextNode(" Debug overlay"));
+
+    const debugInfo = document.createElement("div");
+    debugInfo.className = "hint";
+    debugInfo.style.display = "none";
+    debugInfo.textContent = "debug: -";
+
+    debugBox.append(debugEnableLabel, scanBtn, debugOverlayLabel, debugInfo);
+
+    secBody.append(
+      row1,
+      makeField("Mode", mode),
+      makeField("Dictionary", dict),
+      makeField("Marker size (mm)", markerSize),
+      makeField("Smoothing", smooth),
+      makeField("Contrast boost", contrast.wrap),
+      makeField("Hold frames", holdMax.wrap),
+      scaleEnableLabel,
+      makeField("Scale min", scaleMin.wrap),
+      makeField("Scale max", scaleMax.wrap),
+      makeField("X sens", sx.wrap),
+      makeField("Y sens", sy.wrap),
+      axisBox,
+      hint,
+      status,
+      debugBox
+    );
+    section.append(secHead, secBody);
+
+    (document.getElementById("sideBody") || dom.sidebar || document.body).appendChild(section);
+
+    const rowMode = secBody.children[1];
+    const rowDict = secBody.children[2];
+    const rowMarker = secBody.children[3];
+    const rowSmooth = secBody.children[4];
+    const rowContrast = secBody.children[5];
+    const rowHold = secBody.children[6];
+    const rowScaleEnable = secBody.children[7];
+    const rowScaleMin = secBody.children[8];
+    const rowScaleMax = secBody.children[9];
+    const rowSX = secBody.children[10];
+    const rowSY = secBody.children[11];
+    const rowAxis = secBody.children[12]; // axisBox
+
+    return {
+      section, enable, preview, debug, debugOverlay, mode, dict, markerSize, smooth,
+      contrastRange: contrast.range, contrastNum: contrast.num,
+      holdRange: holdMax.range, holdNum: holdMax.num,
+      scaleEnable,
+      scaleMinRange: scaleMin.range, scaleMinNum: scaleMin.num,
+      scaleMaxRange: scaleMax.range, scaleMaxNum: scaleMax.num,
+      sxRange: sx.range, sxNum: sx.num,
+      syRange: sy.range, syNum: sy.num,
+      calibBtn, scanBtn,
+      btnXp, btnXm, btnYp, btnYm, btnZp, btnZm, btnAxisReset,
+      status, debugInfo,
+      rowMode, rowDict, rowMarker, rowSmooth, rowContrast, rowHold,
+      rowScaleEnable, rowScaleMin, rowScaleMax,
+      rowSX, rowSY, rowAxis,
+      hint,
+    };
+  }
+
+  const els = createSection();
+
+  function bindPair(rangeEl, numEl, setter){
+    const apply = (v)=>{
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      rangeEl.value = String(n);
+      numEl.value = String(n);
+      setter(n);
+    };
+    rangeEl.addEventListener("input", ()=> apply(rangeEl.value));
+    numEl.addEventListener("input", ()=> apply(numEl.value));
+  }
+
+  function updateModeUI(){
+    const mode = els.mode.value;
+    const isAruco = (mode === "aruco");
+    const isHand = (mode === "hand");
+    const isMouse = (mode === "mouse");
+
+    els.rowDict.style.display = isAruco ? "grid" : "none";
+    els.rowMarker.style.display = isAruco ? "grid" : "none";
+    els.rowSmooth.style.display = (isAruco || isHand) ? "grid" : "none";
+    els.rowContrast.style.display = isAruco ? "grid" : "none";
+    els.rowHold.style.display = isAruco ? "grid" : "none";
+    els.rowScaleEnable.style.display = isAruco ? "flex" : "none";
+    els.rowScaleMin.style.display = (isAruco && state.scaleEnabled) ? "grid" : "none";
+    els.rowScaleMax.style.display = (isAruco && state.scaleEnabled) ? "grid" : "none";
+    els.rowAxis.style.display = isAruco ? "flex" : "none";
+    els.rowSX.style.display = isMouse ? "grid" : "none";
+    els.rowSY.style.display = isMouse ? "grid" : "none";
+
+    els.preview.disabled = isMouse;
+    if (isMouse) els.preview.checked = false;
+  }
+
+  // === プレビューコンテナ（ドラッグ移動 + ホイールズーム） ===
+  const previewState = {
+    container: null,
+    width: 240,
+    height: 180,
+    minW: 120,
+    maxW: 640,
+  };
+
+  function ensurePreviewContainer(){
+    if (previewState.container) return previewState.container;
+    const c = document.createElement("div");
+    c.style.cssText = `
+      position:fixed; left:12px; bottom:12px;
+      width:${previewState.width}px; height:${previewState.height}px;
+      z-index:9999; border-radius:8px; overflow:hidden;
+      border:1px solid #444; background:#000;
+      cursor:grab; user-select:none; display:none;
+    `;
+    document.body.appendChild(c);
+    previewState.container = c;
+
+    // ドラッグ移動
+    let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+    c.addEventListener("pointerdown", (e)=>{
+      if (e.button !== 0) return;
+      dragging = true;
+      c.setPointerCapture(e.pointerId);
+      c.style.cursor = "grabbing";
+      const rect = c.getBoundingClientRect();
+      startX = e.clientX; startY = e.clientY;
+      startLeft = rect.left; startTop = rect.top;
+      e.preventDefault();
+    });
+
+    c.addEventListener("pointermove", (e)=>{
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      c.style.left = `${startLeft + dx}px`;
+      c.style.top = `${startTop + dy}px`;
+      c.style.right = "auto";
+      c.style.bottom = "auto";
+      e.preventDefault();
+    });
+
+    const endDrag = (e)=>{
+      if (!dragging) return;
+      dragging = false;
+      c.style.cursor = "grab";
+      if (e) c.releasePointerCapture(e.pointerId);
+    };
+    c.addEventListener("pointerup", endDrag);
+    c.addEventListener("pointercancel", endDrag);
+
+    // ホイールズーム
+    c.addEventListener("wheel", (e)=>{
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      let newW = Math.round(previewState.width * factor);
+      newW = Math.max(previewState.minW, Math.min(previewState.maxW, newW));
+      const newH = Math.round(newW * 3 / 4);
+      previewState.width = newW;
+      previewState.height = newH;
+      c.style.width = `${newW}px`;
+      c.style.height = `${newH}px`;
+    }, { passive: false });
+
+    return c;
+  }
+
+  function ensureVideoEl(){
+    if (state.video) return state.video;
+    const container = ensurePreviewContainer();
+    const v = document.createElement("video");
+    v.autoplay = true;
+    v.muted = true;
+    v.playsInline = true;
+    v.setAttribute("playsinline", "");
+    v.style.cssText = `
+      position:absolute; left:0; top:0;
+      width:100%; height:100%;
+      object-fit:cover; pointer-events:none;
+    `;
+    container.appendChild(v);
+    state.video = v;
+    return v;
+  }
+
+  function ensureOverlayCanvas(){
+    if (state.overlayCanvas) return state.overlayCanvas;
+    const container = ensurePreviewContainer();
+    const c = document.createElement("canvas");
+    c.style.cssText = `
+      position:absolute; left:0; top:0;
+      width:100%; height:100%;
+      pointer-events:none;
+    `;
+    container.appendChild(c);
+    state.overlayCanvas = c;
+    state.overlayCtx = c.getContext("2d");
+    return c;
+  }
+
+  function clearOverlay(){
+    const c = state.overlayCanvas;
+    const ctx = state.overlayCtx;
+    if (!c || !ctx) return;
+    ctx.clearRect(0, 0, c.width, c.height);
+  }
+
+  function updatePreviewVisibility(){
+    const container = previewState.container;
+    const showOverlay = state.showPreview && (state.debugEnabled || state.scanMode) && state.mode !== "mouse";
+    if (container) container.style.display = state.showPreview ? "block" : "none";
+    if (state.overlayCanvas) state.overlayCanvas.style.display = showOverlay ? "block" : "none";
+    if (!showOverlay) clearOverlay();
+  }
+
+  function drawArucoDebug(markers, primary, pose){
+    const video = state.video;
+    const c = ensureOverlayCanvas();
+    const ctx = state.overlayCtx;
+    if (!ctx || !video) return;
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    if (c.width !== w || c.height !== h){
+      c.width = w;
+      c.height = h;
+    }
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!state.showPreview || !(state.debugEnabled || state.scanMode)) return;
+
+    ctx.lineWidth = Math.max(2, Math.round(w / 320));
+    for (const m of (markers || [])){
+      const isPrimary = primary && m.id === primary.id;
+      ctx.strokeStyle = isPrimary ? "#ff5050" : "#00ff66";
+      ctx.fillStyle = isPrimary ? "#ff5050" : "#00ff66";
+      const pts = m.corners || [];
+      if (pts.length >= 4){
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.closePath();
+        ctx.stroke();
+        const cx = pts.reduce((s,p)=>s+p.x,0)/pts.length;
+        const cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
+        ctx.font = `${Math.max(12, Math.round(w/32))}px sans-serif`;
+        ctx.fillText(`id:${m.id}`, cx + 6, cy - 6);
+      }
+    }
+    if (primary){
+      const txt = `markers:${markers.length} primary:${primary.id} pose:${pose ? 'ok' : 'ng'} ${w}x${h}`;
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(6, 6, Math.min(c.width - 12, 340), 24);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "14px sans-serif";
+      ctx.fillText(txt, 12, 23);
+    }
+  }
+
+  function ensureCanvas(){
+    if (state.canvas) return state.canvas;
+    const c = document.createElement("canvas");
+    c.width = 640;
+    c.height = 480;
+    state.canvas = c;
+    state.ctx = c.getContext("2d", { willReadFrequently: true });
+    return c;
+  }
+
+  function loadScript(url){
+    return new Promise((resolve, reject)=>{
+      const s = document.createElement("script");
+      s.src = url;
+      s.async = true;
+      s.onload = ()=> resolve();
+      s.onerror = ()=> reject(new Error(`Failed to load ${url}`));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function ensureArucoLib(){
+    if (state.libReady && window.AR && window.POS) return;
+    if (state.loadingLib){
+      while (state.loadingLib) await new Promise(r=>setTimeout(r, 50));
+      if (state.libReady && window.AR && window.POS) return;
+    }
+
+    state.loadingLib = true;
+    try{
+      for (const url of SCRIPT_URLS){
+        console.log(`[tracking_cube] loading: ${url}`);
+        await loadScript(url);
+      }
+      if (!window.AR || !window.POS) throw new Error("Aruco library globals not found");
+
+      // Detector 生成テスト
+      console.log(`[tracking_cube] AR.Detector found:`, typeof window.AR.Detector);
+      console.log(`[tracking_cube] creating detector with dictionary: "${state.dictionary}"`);
+
+      // 辞書名が使えるか確認
+      try{
+        state.detector = new window.AR.Detector({ dictionaryName: state.dictionary });
+        console.log(`[tracking_cube] detector created OK with "${state.dictionary}"`);
+      }catch(dictErr){
+        console.warn(`[tracking_cube] dictionary "${state.dictionary}" failed, falling back to default`, dictErr);
+        state.detector = new window.AR.Detector();
+        console.log(`[tracking_cube] detector created with DEFAULT dictionary`);
+      }
+
+      // 簡易テスト: 黒画像を食わせてクラッシュしないか確認
+      try{
+        const testCanvas = document.createElement("canvas");
+        testCanvas.width = 64; testCanvas.height = 64;
+        const testCtx = testCanvas.getContext("2d");
+        testCtx.fillStyle = "#fff";
+        testCtx.fillRect(0, 0, 64, 64);
+        const testData = testCtx.getImageData(0, 0, 64, 64);
+        const testResult = state.detector.detect(testData);
+        console.log(`[tracking_cube] test detect OK, returned ${testResult?.length ?? 0} markers`);
+      }catch(testErr){
+        console.error("[tracking_cube] test detect FAILED:", testErr);
+      }
+
+      state.libReady = true;
+    } finally {
+      state.loadingLib = false;
+    }
+  }
+
+  async function startCamera(mode = state.mode){
+    if (!navigator.mediaDevices?.getUserMedia){
+      throw new Error("getUserMedia が使えません。localhost で開いているか確認してください。");
+    }
+
+    const wantMode = (mode === "hand") ? "hand" : "aruco";
+    if (state.stream && state.cameraMode === wantMode) return;
+    if (state.stream && state.cameraMode !== wantMode){
+      await stopCamera();
+    }
+
+    const video = ensureVideoEl();
+    const facingMode = (wantMode === "hand") ? "user" : "environment";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode,
+               width:  { min: 640, ideal: 1280 },
+               height: { min: 480, ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    state.stream = stream;
+    state.cameraMode = wantMode;
+    console.log(`[tracking_cube] camera actual: ${video.videoWidth}x${video.videoHeight} (${wantMode})`);
+    updatePreviewVisibility();
+  }
+
+  async function stopCamera(){
+    if (state.video){
+      try { state.video.pause(); } catch {}
+      try { state.video.srcObject = null; } catch {}
+    }
+    if (state.stream){
+      for (const t of state.stream.getTracks()){
+        try { t.stop(); } catch {}
+      }
+    }
+    state.stream = null;
+    state.cameraMode = null;
+    state.posit = null;
+    state.lastQ = null;
+    state.lastRawCubeQ = null;
+    state.lostCount = 0;
+    state.lastPrimaryId = -1;
+    state.lastScale = null;
+    // スケールを元に戻す
+    const pivot = viewer.model?.currentPivot;
+    if (pivot) pivot.scale.setScalar(1.0);
+    clearOverlay();
+    setDebugInfo("");
+    setLocalStatus("camera stopped");
+  }
+
+  async function ensureHandLandmarker(){
+    const h = state.hand;
+    if (h.ready && h.landmarker) return;
+
+    if (h.loading){
+      while (h.loading) await new Promise(r=>setTimeout(r, 50));
+      if (h.landmarker) return;
+    }
+
+    h.loading = true;
+    try{
+      const mod = await import(HAND_VISION_BUNDLE_URL);
+      const { FilesetResolver, HandLandmarker } = mod;
+      const vision = await FilesetResolver.forVisionTasks(HAND_WASM_URL);
+
+      const landmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: HAND_MODEL_URL },
+        runningMode: "VIDEO",
+        numHands: 1,
+        minHandDetectionConfidence: 0.6,
+        minHandPresenceConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+
+      h.visionMod = mod;
+      h.landmarker = landmarker;
+      h.ready = true;
+    } finally {
+      h.loading = false;
+    }
+  }
+
+  function resetHandState(){
+    const h = state.hand;
+    h.active = false;
+    h.lastVideoTime = -1;
+    h.filtered = null;
+    h.calibZ = null;
+    h.calibX = null;
+    h.calibModelQ = null;
+    h.lastHandQ = null;
+    h.lastHandScale = null;
+    h.calibHandSize = null;
+  }
+
+  async function setHandEnabled(on){
+    resetHandState();
+    if (!on) return;
+    await ensureHandLandmarker();
+    await startCamera("hand");
+    state.hand.active = true;
+    generalApi()?.resetNonContactRotatePointer?.();
+  }
+
+  /**
+   * 手のひらの向き（Z回転・X回転）を world landmarks から抽出
+   * Z回転: 手首のロール（手のひら⇄手の甲）
+   * X回転: 指先の傾き（上⇄下）
+   */
+  function extractPalmOrientation(result){
+    const wl = result?.worldLandmarks?.[0];
+    if (!wl || wl.length < 21) return null;
+
+    const wrist = wl[0];
+    const indexMcp = wl[5];
+    const middleMcp = wl[9];
+    const pinkyMcp = wl[17];
+    const middleTip = wl[12];
+
+    // 指方向ベクトル: wrist → middle_finger_mcp
+    const fingerDir = {
+      x: middleMcp.x - wrist.x,
+      y: middleMcp.y - wrist.y,
+      z: middleMcp.z - wrist.z
+    };
+    const fLen = Math.sqrt(fingerDir.x**2 + fingerDir.y**2 + fingerDir.z**2);
+    if (fLen < 0.0001) return null;
+    fingerDir.x /= fLen; fingerDir.y /= fLen; fingerDir.z /= fLen;
+
+    // 手のひら面のベクトル
+    const v1 = { x: indexMcp.x - wrist.x, y: indexMcp.y - wrist.y, z: indexMcp.z - wrist.z };
+    const v2 = { x: pinkyMcp.x - wrist.x, y: pinkyMcp.y - wrist.y, z: pinkyMcp.z - wrist.z };
+
+    // 法線 = cross(v1, v2)
+    const normal = {
+      x: v1.y * v2.z - v1.z * v2.y,
+      y: v1.z * v2.x - v1.x * v2.z,
+      z: v1.x * v2.y - v1.y * v2.x
+    };
+    const nLen = Math.sqrt(normal.x**2 + normal.y**2 + normal.z**2);
+    if (nLen < 0.0001) return null;
+    normal.x /= nLen; normal.y /= nLen; normal.z /= nLen;
+
+    // Z回転（手のひらロール）: 法線の XZ 平面上の角度
+    // 手のひらがカメラ向き(normal.z>0) → 0, 手の甲がカメラ向き → ±π
+    const zAngle = Math.atan2(normal.x, normal.z);
+
+    // X回転（指先の傾き）: 指方向ベクトルの YZ 平面上の角度
+    // 指が上(y>0) → 0, 指が下(y<0) → ±π
+    const xAngle = Math.atan2(-fingerDir.z, fingerDir.y);
+
+    // 手のサイズ（ズーム用）: wrist → middle finger tip の距離
+    const handSize = Math.sqrt(
+      (middleTip.x - wrist.x)**2 +
+      (middleTip.y - wrist.y)**2 +
+      (middleTip.z - wrist.z)**2
+    );
+
+    return { zAngle, xAngle, handSize, fingerDir, normal };
+  }
+
+  function updateHandTracking(nowMs){
+    if (state.mode !== "hand") return;
+    if (!state.enabled || !state.stream || !state.video) return;
+
+    const h = state.hand;
+    if (!h.active || !h.landmarker) return;
+    if (state.video.readyState < 2) return;
+    if (state.video.currentTime === h.lastVideoTime) return;
+    h.lastVideoTime = state.video.currentTime;
+
+    let result;
+    try{
+      result = h.landmarker.detectForVideo(state.video, nowMs);
+    }catch(err){
+      if (h.debug) console.warn("hand detect error", err);
+      return;
+    }
+
+    const orient = extractPalmOrientation(result);
+    if (!orient){
+      h.calibZ = null;
+      h.calibX = null;
+      h.lastHandQ = null;
+      h.lastHandScale = null;
+      h.calibHandSize = null;
+      setLocalStatus("hand: lost");
+      return;
+    }
+
+    // 診断ログ（毎フレーム出すと重いので 10 フレームに1回）
+    if (!h._diagCount) h._diagCount = 0;
+    h._diagCount++;
+    if (h._diagCount % 10 === 0){
+      const n = orient.normal;
+      const f = orient.fingerDir;
+      console.log(`[hand-diag] normal=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)}) finger=(${f.x.toFixed(2)},${f.y.toFixed(2)},${f.z.toFixed(2)}) zAngle=${(orient.zAngle*180/Math.PI).toFixed(1)}° xAngle=${(orient.xAngle*180/Math.PI).toFixed(1)}°`);
+    }
+
+    // 初回検出: キャリブレーション
+    if (h.calibZ === null){
+      h.calibZ = orient.zAngle;
+      h.calibX = orient.xAngle;
+      h.calibHandSize = orient.handSize;
+      const api = generalApi();
+      h.calibModelQ = api?.getPivotQuaternion?.()
+        || api?.getCorrectQuat?.()
+        || new THREE.Quaternion();
+      setLocalStatus("hand: calibrated");
+      return;
+    }
+
+    // 相対角度
+    let dz = orient.zAngle - h.calibZ;
+    let dx = orient.xAngle - h.calibX;
+
+    // [-π, π] にラップ
+    while (dz > Math.PI) dz -= 2 * Math.PI;
+    while (dz < -Math.PI) dz += 2 * Math.PI;
+    while (dx > Math.PI) dx -= 2 * Math.PI;
+    while (dx < -Math.PI) dx += 2 * Math.PI;
+
+    // 180° 物理 → 360° モデル（×2倍率）
+    const modelZ = dz * 2;
+    const modelX = dx * 2;
+
+    // 回転 quaternion 生成（Z × X の順）
+    const qz = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), modelZ);
+    const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), modelX);
+    const handRotQ = qz.multiply(qx);
+
+    // calibModelQ のローカル空間で適用
+    const baseQ = h.calibModelQ || new THREE.Quaternion();
+    const targetQ = baseQ.clone().multiply(handRotQ).normalize();
+
+    // スムージング（Smoothing スライダーの値を使用）
+    const alpha = Math.max(0.01, 1 - state.smoothing);
+    if (!h.lastHandQ){
+      h.lastHandQ = targetQ.clone();
+    } else {
+      h.lastHandQ.slerp(targetQ, alpha);
+    }
+
+    const api = generalApi();
+    api?.setPivotQuaternionDirect?.(h.lastHandQ.clone());
+
+    // ステータス
+    const zDeg = Math.round(dz * 180 / Math.PI);
+    const xDeg = Math.round(dx * 180 / Math.PI);
+    const zRaw = Math.round(orient.zAngle * 180 / Math.PI);
+    const xRaw = Math.round(orient.xAngle * 180 / Math.PI);
+    setLocalStatus(`hand: dZ:${zDeg}° dX:${xDeg}° raw(Z:${zRaw}° X:${xRaw}°)`);
+  }
+
+  function markerArea(marker){
+    const c = marker?.corners || [];
+    if (c.length < 4) return 0;
+    let area = 0;
+    for (let i=0;i<4;i++){
+      const a = c[i];
+      const b = c[(i+1)%4];
+      area += (a.x * b.y) - (b.x * a.y);
+    }
+    return Math.abs(area) * 0.5;
+  }
+
+  function pickPrimaryMarker(markers){
+    if (!markers?.length) return null;
+    // 登録済みの面IDのみ対象
+    const known = markers.filter(m => FACE_OFFSET_INVS[m.id] != null);
+    if (!known.length) return null;
+
+    // 面積最大を求める
+    let best = known[0];
+    let bestArea = markerArea(best);
+    for (let i=1;i<known.length;i++){
+      const a = markerArea(known[i]);
+      if (a > bestArea){
+        best = known[i];
+        bestArea = a;
+      }
+    }
+
+    // ヒステリシス: 前フレームのIDがまだ見えていれば、
+    // 新しいIDの面積が hysteresisRatio 倍を超えないかぎり前のIDを維持
+    if (state.lastPrimaryId >= 0 && best.id !== state.lastPrimaryId){
+      const prev = known.find(m => m.id === state.lastPrimaryId);
+      if (prev){
+        const prevArea = markerArea(prev);
+        if (bestArea < prevArea * state.hysteresisRatio){
+          return prev; // 前のIDを維持
+        }
+      }
+    }
+
+    return best;
+  }
+
+  function buildPositPose(marker){
+    const canvas = state.canvas;
+    if (!canvas || !marker) return null;
+
+    if (!state.posit || state._positWidth !== canvas.width || state._positMarkerSize !== state.markerSizeMm){
+      state.posit = new window.POS.Posit(state.markerSizeMm, canvas.width);
+      state._positWidth = canvas.width;
+      state._positMarkerSize = state.markerSizeMm;
+    }
+
+    const corners = marker.corners.map(c => ({ x: c.x - (canvas.width / 2), y: (canvas.height / 2) - c.y }));
+    const pose = state.posit.pose(corners);
+    if (!pose?.bestRotation) return null;
+    return pose;
+  }
+
+  function rawQuaternionFromPose(pose){
+    const r = pose.bestRotation;
+    const m = new THREE.Matrix4().set(
+      r[0][0], r[0][1], r[0][2], 0,
+      r[1][0], r[1][1], r[1][2], 0,
+      r[2][0], r[2][1], r[2][2], 0,
+      0, 0, 0, 1
+    );
+
+    const q = new THREE.Quaternion().setFromRotationMatrix(m);
+    const qFix = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI);
+    q.premultiply(qFix).normalize();
+    return q;
+  }
+
+  /** best と alternative のうち lastQ に近い方を返す（POSIT フリップ抑制） */
+  function chooseStableQuaternion(pose){
+    const qBest = rawQuaternionFromPose(pose);
+    if (!pose.alternativeRotation) return qBest;
+
+    const altPose = { bestRotation: pose.alternativeRotation };
+    const qAlt = rawQuaternionFromPose(altPose);
+
+    if (!state.lastQ) return qBest;
+
+    const dotBest = Math.abs(state.lastQ.dot(qBest));
+    const dotAlt  = Math.abs(state.lastQ.dot(qAlt));
+    return (dotAlt > dotBest) ? qAlt : qBest;
+  }
+
+  /** rawQ に面オフセット補正を掛けてキューブ本体の姿勢を返す。未登録IDは null */
+  function compensateFaceOffset(rawQ, markerId){
+    const inv = FACE_OFFSET_INVS[markerId];
+    if (!inv) return null;
+    return rawQ.clone().multiply(inv);
+  }
+
+  /**
+   * 複数マーカーから cubeQ を求めて加重平均する。
+   * entries: [{ marker, area }]  ← 登録済みIDのみ
+   * 戻り値: { cubeQ, primaryId, usedCount, consistency } | null
+   *   consistency: 0.0（完全一致）〜 1.0（180°ずれ）。1枚のみの場合は 0。
+   */
+  function fuseMultiMarkerPose(entries){
+    // 各マーカーから cubeQ を計算
+    const results = [];
+    for (const { marker, area } of entries){
+      const pose = buildPositPose(marker);
+      if (!pose) continue;
+      const rawQ = chooseStableQuaternion(pose);
+      const cubeQ = compensateFaceOffset(rawQ, marker.id);
+      if (!cubeQ) continue;
+      results.push({ id: marker.id, cubeQ, area });
+    }
+    if (!results.length) return null;
+
+    // 1枚なら統合不要
+    if (results.length === 1){
+      return { cubeQ: results[0].cubeQ, primaryId: results[0].id, usedCount: 1, consistency: 0 };
+    }
+
+    // 面積で降順ソート
+    results.sort((a, b) => b.area - a.area);
+
+    // 不一致度を計算: 基準（最大面積）と各 cubeQ の角度差の加重平均
+    const base = results[0];
+    let disagreeSum = 0;
+    let disagreeWeight = 0;
+    for (let i = 1; i < results.length; i++){
+      const r = results[i];
+      // dot の絶対値: 1.0 = 完全一致、0.0 = 90°ずれ
+      const dot = Math.abs(base.cubeQ.dot(r.cubeQ));
+      // 角度差を 0〜1 に変換 (0=一致, 1=180°)
+      const diff = 1.0 - Math.min(1.0, dot);
+      disagreeSum += diff * r.area;
+      disagreeWeight += r.area;
+    }
+    const consistency = disagreeWeight > 0 ? disagreeSum / disagreeWeight : 0;
+
+    // 最大面積の cubeQ を基準に、他を SLERP で混合（増分加重平均）
+    let fused = base.cubeQ.clone();
+    let totalWeight = base.area;
+
+    for (let i = 1; i < results.length; i++){
+      const r = results[i];
+      // 同じ半球に揃える（dot < 0 なら反転）
+      if (fused.dot(r.cubeQ) < 0) r.cubeQ.set(-r.cubeQ.x, -r.cubeQ.y, -r.cubeQ.z, -r.cubeQ.w);
+      totalWeight += r.area;
+      const t = r.area / totalWeight;
+      fused.slerp(r.cubeQ, t);
+    }
+    fused.normalize();
+
+    return { cubeQ: fused, primaryId: base.id, usedCount: results.length, consistency };
+  }
+
+  /**
+   * @param {THREE.Quaternion} rawQ
+   * @param {number} consistency - 0.0（安定）〜 1.0（不安定）
+   * @param {number} areaRatio - マーカー最大面積 / カメラ全体（0.0〜1.0）
+   */
+  function applyTrackedQuaternion(rawQ, consistency = 0, areaRatio = 1){
+    if (!rawQ) return false;
+    const api = generalApi();
+    if (!api?.setPivotQuaternionDirect) return false;
+
+    const q = rawQ.clone();
+
+    // 適応的スムージング（2つの要因）:
+    const baseSmoothing = state.smoothing;
+    const conBoost = Math.min(1.0, consistency * 20);
+    const areaThreshHi = 0.10;
+    const areaThreshLo = 0.01;
+    const areaNorm = Math.max(0, Math.min(1, (areaRatio - areaThreshLo) / (areaThreshHi - areaThreshLo)));
+    const areaBoost = 1.0 - areaNorm;
+    const boostFactor = Math.min(1.0, conBoost + areaBoost);
+    const adaptiveSmoothing = baseSmoothing + (0.97 - baseSmoothing) * boostFactor;
+    const alpha = Math.max(0.001, Math.min(1, 1 - adaptiveSmoothing));
+
+    if (!state.lastQ){
+      state.lastQ = q.clone();
+    } else {
+      state.lastQ.slerp(q, alpha);
+    }
+    // ワールド空間で直接設定（basePivotQuat を経由しない）
+    return !!api.setPivotQuaternionDirect(state.lastQ.clone());
+  }
+
+  /** マーカー面積からモデルのスケールを計算・適用 */
+  function applyAreaScale(maxArea, canvasW, canvasH){
+    if (!state.scaleEnabled) return;
+    const pivot = viewer.model?.currentPivot;
+    if (!pivot) return;
+
+    const totalPx = canvasW * canvasH;
+    if (totalPx <= 0) return;
+
+    // area 比率（0.0 ~ 1.0）
+    const ratio = maxArea / totalPx;
+
+    // areaRatioMin ~ areaRatioMax を 0 ~ 1 に正規化
+    const t = Math.max(0, Math.min(1,
+      (ratio - state.areaRatioMin) / (state.areaRatioMax - state.areaRatioMin)
+    ));
+
+    // scaleMin ~ scaleMax にマッピング
+    const targetScale = state.scaleMax - t * (state.scaleMax - state.scaleMin);
+
+    // スムージング（既存の smoothing 値を使用）
+    if (state.lastScale === null){
+      state.lastScale = targetScale;
+    } else {
+      const alpha = Math.max(0.001, Math.min(1, 1 - state.smoothing));
+      state.lastScale += (targetScale - state.lastScale) * alpha;
+    }
+
+    pivot.scale.setScalar(state.lastScale);
+  }
+
+  async function setArucoEnabled(on){
+    state.enabled = !!on;
+    if (!state.enabled){
+      await stopCamera();
+      return;
+    }
+
+    await ensureArucoLib();
+    await startCamera();
+  }
+
+  async function disableAllInputs(){
+    await stopCamera();
+    resetHandState();
+    const api = generalApi();
+    if (api?.setNonContactRotateEnabled){
+      await api.setNonContactRotateEnabled(false, "off");
+    }
+    api?.resetNonContactRotatePointer?.();
+    state.enabled = false;
+  }
+
+  /** Aruco モードに入るとき: カメラを固定位置に、OrbitControls を無効化 */
+  function enterArucoView(){
+    const { camera, controls, model } = viewer;
+    if (!camera || !controls) return;
+
+    // 現在のカメラ状態を保存
+    if (!state.savedView){
+      state.savedView = {
+        pos: camera.position.clone(),
+        target: controls.target.clone(),
+        controlsEnabled: controls.enabled,
+        pivotQuat: model.currentPivot ? model.currentPivot.quaternion.clone() : null,
+      };
+    }
+
+    // 「回転をセット」で保存した正しい向きに設定
+    const api = generalApi();
+    if (api?.applyCorrectQuat) api.applyCorrectQuat();
+
+    // モデルのバウンディングボックスからカメラ距離を計算
+    let center = new THREE.Vector3();
+    let dist = 5;
+    if (model.currentPivot){
+      const box = new THREE.Box3().setFromObject(model.currentPivot);
+      center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      dist = maxDim * 2.0;
+    }
+
+    // カメラを水平 +Y 方向に向ける: (0, -dist, 0) + center
+    camera.position.set(center.x, center.y - dist, center.z);
+    controls.target.copy(center);
+    controls.update();
+
+    // OrbitControls 無効化（ホイールズームのみ許可）
+    controls.enableRotate = false;
+    controls.enablePan = false;
+    controls.enableZoom = true;
+    controls.update();
+  }
+
+  /** Aruco モードを抜けるとき: カメラ・操作を復元 */
+  function leaveArucoView(){
+    const { camera, controls, model } = viewer;
+    if (!camera || !controls || !state.savedView) return;
+
+    camera.position.copy(state.savedView.pos);
+    controls.target.copy(state.savedView.target);
+    controls.enableRotate = true;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controls.update();
+
+    // ピボットの姿勢を復元
+    if (state.savedView.pivotQuat && model.currentPivot){
+      model.currentPivot.quaternion.copy(state.savedView.pivotQuat);
+    }
+    state.savedView = null;
+  }
+
+  async function syncInputMode(){
+    const mode = els.mode.value;
+    state.mode = mode;
+
+    // Scan Mode をモード切替時にリセット
+    if (state.scanMode){
+      state.scanMode = false;
+      els.scanBtn.textContent = "Scan IDs (面のID調査)";
+      els.scanBtn.style.borderColor = "#ca4";
+    }
+
+    updateModeUI();
+
+    const api = generalApi();
+    if (!api?.setNonContactRotateEnabled || !api?.setNonContactRotateSensitivity || !api?.applyNonContactRotateDelta || !api?.setPivotQuaternionDirect){
+      throw new Error("general.html に tracking cube 対応の受け口がありません。");
+    }
+
+    api.setNonContactRotateSensitivity(Number(els.sxNum.value), Number(els.syNum.value));
+
+    if (!els.enable.checked){
+      leaveArucoView();
+      await disableAllInputs();
+      setLocalStatus("off");
+      setStatus("cube tracking: off");
+      return;
+    }
+
+    state.showPreview = (mode !== "mouse") ? !!els.preview.checked : false;
+    updatePreviewVisibility();
+
+    if (mode === "aruco"){
+      await api.setNonContactRotateEnabled(false, "off");
+      api.resetNonContactRotatePointer?.();
+      enterArucoView();
+      try{
+        setLocalStatus("loading aruco...");
+        setStatus("cube tracking: loading...");
+        await setHandEnabled(false);
+        await setArucoEnabled(true);
+        setLocalStatus("tracking — Calibrate で軸を合わせてください");
+        setStatus("cube tracking: tracking");
+      }catch(err){
+        console.error(err);
+        leaveArucoView();
+        await disableAllInputs();
+        els.enable.checked = false;
+        setLocalStatus("failed");
+        setStatus("cube tracking: failed");
+        alert("Cube tracking の開始に失敗しました: " + (err?.message || err));
+      }
+      return;
+    }
+
+    if (mode === "mouse"){
+      leaveArucoView();
+      try{
+        await setHandEnabled(false);
+        await stopCamera();
+        state.enabled = false;
+        await api.setNonContactRotateEnabled(true, "mouse");
+        setLocalStatus("mouse mode");
+        setStatus("non-contact test: mouse");
+      }catch(err){
+        console.error(err);
+        await disableAllInputs();
+        els.enable.checked = false;
+        setLocalStatus("failed");
+        setStatus("cube tracking: failed");
+        alert("開始失敗: " + (err?.message || err));
+      }
+      return;
+    }
+
+    try{
+      await api.setNonContactRotateEnabled(false, "off");
+      api.resetNonContactRotatePointer?.();
+      enterArucoView();  // hand も +Y カメラ固定 + correctQuat 適用
+      await setHandEnabled(true);
+      state.enabled = true;
+      setLocalStatus("hand mode: ready");
+      setStatus("non-contact test: hand ready");
+    }catch(err){
+      console.error(err);
+      leaveArucoView();
+      await disableAllInputs();
+      els.enable.checked = false;
+      setLocalStatus("hand mode failed");
+      setStatus("non-contact test: hand failed");
+      alert("ハンドトラッキング開始失敗: " + (err?.message || err));
+    }
+  }
+
+  function tick(now){
+    state.rafId = requestAnimationFrame(tick);
+
+    if (state.mode === "hand"){
+      clearOverlay();
+      updateHandTracking(now || performance.now());
+      return;
+    }
+
+    if (state.mode !== "aruco"){
+      clearOverlay();
+      return;
+    }
+    if (!state.enabled || !state.stream || !state.video || !state.libReady) return;
+    if (state.video.readyState < 2) return;
+
+    // フレームカウンター（診断用）
+    if (!state._frameCount) state._frameCount = 0;
+    state._frameCount++;
+
+    const video = state.video;
+    const canvas = ensureCanvas();
+    const ctx = state.ctx;
+
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    if (canvas.width !== w || canvas.height !== h){
+      canvas.width = w;
+      canvas.height = h;
+      state.posit = null;
+      state._positWidth = null;
+    }
+
+    // 前処理: コントラストのみ（grayscaleはjs-aruco2が内部で行う）
+    if (state.contrast > 1.01){
+      ctx.filter = `contrast(${state.contrast})`;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.filter = "none";
+    } else {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+
+    let markers = [];
+    try{
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // 最初の5フレームだけ画像データの診断を出力
+      if (state._frameCount <= 5){
+        const px = imageData.data;
+        let sum = 0;
+        for (let i = 0; i < Math.min(px.length, 4000); i += 4) sum += px[i];
+        const avg = sum / (Math.min(px.length, 4000) / 4);
+        console.log(`[tracking_cube] frame ${state._frameCount}: canvas=${canvas.width}x${canvas.height} avgBrightness=${avg.toFixed(1)} dataLen=${px.length}`);
+      }
+
+      markers = state.detector.detect(imageData) || [];
+      // ゴースト ID 除去
+      markers = markers.filter(m => m.id !== 97);
+    } catch (err){
+      console.warn("aruco detect failed", err);
+      setLocalStatus("detect failed");
+      return;
+    }
+    // 全検出結果を診断（登録外含む）
+    if ((state.debugEnabled || state.scanMode) && markers.length){
+      console.log(`[detect] all ids: [${markers.map(m=>m.id).join(",")}] areas: [${markers.map(m=>Math.round(markerArea(m))).join(",")}]`);
+    }
+
+    // === Scan Mode: 全IDを表示して終了（姿勢推定しない）===
+    if (state.scanMode){
+      drawArucoDebug(markers, markers[0] || null, null);
+      if (markers.length){
+        const info = markers.map(m => `id:${m.id}(${Math.round(markerArea(m))}px²)`).join("  ");
+        setLocalStatus(`SCAN: ${info}`);
+        setDebugInfo(`scan: ${markers.length} markers detected`);
+      } else {
+        setLocalStatus("SCAN: no marker detected");
+        setDebugInfo("scan: 0 markers");
+      }
+      return;
+    }
+
+    // 登録済みマーカーを抽出 + 最小面積フィルター（ゴースト除去）
+    const MIN_AREA = 3000; // 本物は80000+、ゴーストは~1200
+    const known = markers.filter(m => FACE_OFFSET_INVS[m.id] != null);
+    const entries = known
+      .map(m => ({ marker: m, area: markerArea(m) }))
+      .filter(e => e.area >= MIN_AREA);
+
+    // 重複ID除去（同じIDが2回検出されたら面積大の方を残す）
+    const idMap = new Map();
+    for (const e of entries){
+      const prev = idMap.get(e.marker.id);
+      if (!prev || e.area > prev.area) idMap.set(e.marker.id, e);
+    }
+    const uniqueEntries = [...idMap.values()];
+
+    if (!uniqueEntries.length){
+      const detectedIds = markers.map(m => m.id).join(",") || "-";
+      const rawCount = markers.length;
+      state.lostCount++;
+      if (state.lostCount > state.lostMax){
+        drawArucoDebug(markers, null, null);
+        setDebugInfo(`raw:${rawCount} ids:[${detectedIds}] known:0 lost:>${state.lostMax}`);
+        setLocalStatus(rawCount ? `raw:${rawCount} ids:[${detectedIds}] (ghost/<${MIN_AREA}px²)` : "no marker detected");
+      } else {
+        if (state.lastQ){
+          const api = generalApi();
+          api?.setPivotQuaternionDirect?.(state.lastQ.clone());
+        }
+        drawArucoDebug(markers, null, null);
+        setDebugInfo(`raw:${rawCount} ids:[${detectedIds}] holding:${state.lostCount}/${state.lostMax}`);
+        setLocalStatus(`hold ${state.lostCount}/${state.lostMax} raw:${rawCount} ids:[${detectedIds}]`);
+      }
+      return;
+    }
+
+    // 複数マーカー統合
+    const fused = fuseMultiMarkerPose(uniqueEntries);
+    // デバッグ用：最大面積のマーカーを primary として描画
+    const primary = uniqueEntries.reduce((a, b) => a.area > b.area ? a : b).marker;
+    drawArucoDebug(markers, primary, fused ? {} : null);
+
+    if (!fused){
+      setDebugInfo(`mode:aruco known:${uniqueEntries.length} ids:[${uniqueEntries.map(e=>e.marker.id).join(",")}] pose:all_failed`);
+      setLocalStatus(`${uniqueEntries.length} markers / no pose`);
+      return;
+    }
+
+    state.lostCount = 0;
+    state.lastPrimaryId = fused.primaryId;
+    state.lastRawCubeQ = fused.cubeQ.clone();
+
+    let finalPivotQ;
+
+    if (state.calibInvQ && state.calibModelQ){
+      // === キャリブ済みパス ===
+      const relQ = state.calibInvQ.clone().multiply(fused.cubeQ);
+
+      // ミラー補正: webcam とビューワーカメラが向かい合う
+      // Z軸180° conjugation: q=(x,y,z,w) → (-x,-y,z,w)
+      const mirroredRelQ = new THREE.Quaternion(-relQ.x, -relQ.y, relQ.z, relQ.w);
+
+      // ワールド空間で回転を適用（左から掛ける）
+      // → calibModelQ の内容に関係なく、キューブの軸と画面の軸が一致
+      finalPivotQ = state.manualTweak.clone()
+        .multiply(mirroredRelQ)
+        .multiply(state.calibModelQ)
+        .normalize();
+    } else {
+      // === 未キャリブ：モデルの現在姿勢を維持 ===
+      const api = generalApi();
+      finalPivotQ = api?.getPivotQuaternion?.() || new THREE.Quaternion();
+    }
+
+    const maxArea = uniqueEntries.reduce((a, b) => a.area > b.area ? a : b).area;
+    const areaRatio = maxArea / (canvas.width * canvas.height);
+    const ok = applyTrackedQuaternion(finalPivotQ, fused.consistency, areaRatio);
+
+    // エリアスケール
+    applyAreaScale(maxArea, canvas.width, canvas.height);
+
+    const usedIds = uniqueEntries.map(e => e.marker.id).join(",");
+    const areaStr = (areaRatio * 100).toFixed(1);
+    const scaleStr = state.lastScale !== null ? state.lastScale.toFixed(2) : "-";
+    const conStr = (fused.consistency * 100).toFixed(1);
+    setDebugInfo(`fused:${fused.usedCount} ids:[${usedIds}] area:${areaStr}% con:${conStr}% scale:${scaleStr}`);
+    if (ok) setLocalStatus(`fused ${fused.usedCount} markers [${usedIds}]`);
+    else setLocalStatus(`fused ${fused.usedCount} / no model`);
+  }
+
+  bindPair(els.sxRange, els.sxNum, (v)=>{
+    const api = generalApi();
+    api?.setNonContactRotateSensitivity?.(v, Number(els.syNum.value));
+  });
+  bindPair(els.syRange, els.syNum, (v)=>{
+    const api = generalApi();
+    api?.setNonContactRotateSensitivity?.(Number(els.sxNum.value), v);
+  });
+
+  els.enable.addEventListener("change", ()=>{ syncInputMode(); });
+  els.mode.addEventListener("change", ()=>{ syncInputMode(); });
+  els.preview.addEventListener("change", ()=>{
+    if (els.mode.value === "mouse") return;
+    state.showPreview = !!els.preview.checked;
+    updatePreviewVisibility();
+  });
+  els.markerSize.addEventListener("input", ()=>{
+    const v = Number(els.markerSize.value);
+    if (Number.isFinite(v) && v > 0){
+      state.markerSizeMm = v;
+      state.posit = null;
+      state._positMarkerSize = null;
+    }
+  });
+  els.smooth.addEventListener("input", ()=>{
+    const v = Number(els.smooth.value);
+    if (Number.isFinite(v)) state.smoothing = v;
+  });
+  els.dict.addEventListener("change", ()=>{
+    state.dictionary = els.dict.value;
+    if (state.libReady && window.AR){
+      try{
+        state.detector = new window.AR.Detector({ dictionaryName: state.dictionary });
+        console.log(`[tracking_cube] dictionary changed: ${state.dictionary}`);
+      }catch(err){ console.error("dictionary change failed", err); }
+    }
+  });
+  bindPair(els.contrastRange, els.contrastNum, (v)=>{ state.contrast = v; });
+  bindPair(els.holdRange, els.holdNum, (v)=>{ state.lostMax = Math.round(v); });
+  els.scaleEnable.addEventListener("change", ()=>{
+    state.scaleEnabled = !!els.scaleEnable.checked;
+    els.rowScaleMin.style.display = state.scaleEnabled ? "grid" : "none";
+    els.rowScaleMax.style.display = state.scaleEnabled ? "grid" : "none";
+    // OFF にした時はスケールを1.0に戻す
+    if (!state.scaleEnabled){
+      state.lastScale = null;
+      const pivot = viewer.model?.currentPivot;
+      if (pivot) pivot.scale.setScalar(1.0);
+    }
+  });
+  bindPair(els.scaleMinRange, els.scaleMinNum, (v)=>{ state.scaleMin = v; });
+  bindPair(els.scaleMaxRange, els.scaleMaxNum, (v)=>{ state.scaleMax = v; });
+
+  // Debug トグル: Scan IDs と Debug overlay の表示/非表示
+  els.debug.addEventListener("change", ()=>{
+    const on = !!els.debug.checked;
+    els.scanBtn.style.display = on ? "block" : "none";
+    els.debugOverlay.parentElement.style.display = on ? "inline-flex" : "none";
+    els.debugInfo.style.display = on ? "block" : "none";
+    if (!on){
+      // debug off → scan も overlay も off
+      state.scanMode = false;
+      state.debugEnabled = false;
+      els.scanBtn.textContent = "Scan IDs (面のID調査)";
+      els.scanBtn.style.borderColor = "#ca4";
+      els.debugOverlay.checked = false;
+      updatePreviewVisibility();
+    }
+  });
+
+  // Debug overlay チェックボックス
+  els.debugOverlay.addEventListener("change", ()=>{
+    state.debugEnabled = !!els.debugOverlay.checked;
+    updatePreviewVisibility();
+  });
+
+  // キャリブレーション
+  els.calibBtn.addEventListener("click", ()=>{
+    if (!state.lastRawCubeQ){
+      alert("マーカーが検出されていません。\nID 0 を上に、ID 2 をカメラ正面に向けてください。");
+      return;
+    }
+    const api = generalApi();
+    // キューブの現在姿勢の逆 → 以降の relQ の基準
+    state.calibInvQ = state.lastRawCubeQ.clone().invert();
+    // 常に correctQuat（回転セットで保存した正しい向き）を基準にする
+    // → 2回目以降のキャリブでも傾きがリセットされる
+    const correctQ = api?.getCorrectQuat?.();
+    state.calibModelQ = correctQ || api?.getPivotQuaternion?.() || new THREE.Quaternion();
+    // モデルを正しい向きに戻す
+    if (correctQ) api?.setPivotQuaternionDirect?.(correctQ);
+    state.lastQ = null;
+    state.manualTweak.set(0, 0, 0, 1);
+    const fmt = q => `[${q.x.toFixed(3)},${q.y.toFixed(3)},${q.z.toFixed(3)},${q.w.toFixed(3)}]`;
+    console.log(`[calibrate] cubeQ=${fmt(state.lastRawCubeQ)} modelQ=${fmt(state.calibModelQ)}`);
+    setLocalStatus("calibrated!");
+  });
+
+  // ID スキャンモード
+  els.scanBtn.addEventListener("click", ()=>{
+    state.scanMode = !state.scanMode;
+    els.scanBtn.textContent = state.scanMode ? "Stop Scan" : "Scan IDs (面のID調査)";
+    els.scanBtn.style.borderColor = state.scanMode ? "#f44" : "#ca4";
+    // scan mode では preview を自動ON
+    if (state.scanMode && !state.showPreview){
+      state.showPreview = true;
+      els.preview.checked = true;
+    }
+    updatePreviewVisibility();
+    if (state.scanMode){
+      setLocalStatus("SCAN MODE: 各面をカメラに向けてください");
+    } else {
+      setLocalStatus("scan stopped");
+    }
+  });
+
+  // 手動微調整ボタン（ビューワー空間で±90°の後付け回転）
+  function tweakManual(axisVec, angle, label){
+    const dq = new THREE.Quaternion().setFromAxisAngle(axisVec, angle);
+    state.manualTweak.premultiply(dq).normalize();
+    if (state.lastQ){
+      state.lastQ.premultiply(dq).normalize();
+      const api = generalApi();
+      api?.setPivotQuaternionDirect?.(state.lastQ.clone());
+    }
+    setLocalStatus(`tweak: ${label} applied`);
+  }
+  els.btnXp.addEventListener("click", ()=> tweakManual(new THREE.Vector3(1,0,0), Math.PI/2, "X+90"));
+  els.btnXm.addEventListener("click", ()=> tweakManual(new THREE.Vector3(1,0,0), -Math.PI/2, "X-90"));
+  els.btnYp.addEventListener("click", ()=> tweakManual(new THREE.Vector3(0,1,0), Math.PI/2, "Y+90"));
+  els.btnYm.addEventListener("click", ()=> tweakManual(new THREE.Vector3(0,1,0), -Math.PI/2, "Y-90"));
+  els.btnZp.addEventListener("click", ()=> tweakManual(new THREE.Vector3(0,0,1), Math.PI/2, "Z+90"));
+  els.btnZm.addEventListener("click", ()=> tweakManual(new THREE.Vector3(0,0,1), -Math.PI/2, "Z-90"));
+  els.btnAxisReset.addEventListener("click", ()=>{
+    state.calibInvQ = null;
+    state.calibModelQ = null;
+    state.manualTweak.set(0, 0, 0, 1);
+    state.lastQ = null;
+    // correctQuat があれば正しい向きに復帰
+    const api = generalApi();
+    if (api?.applyCorrectQuat) api.applyCorrectQuat();
+    setLocalStatus("axis: cleared (uncalibrated)");
+  });
+
+  updateModeUI();
+  state.rafId = requestAnimationFrame(tick);
+
+  viewer.modules.trackingCube = {
+    setMode: async (mode)=>{ els.mode.value = mode; await syncInputMode(); },
+    setEnabled: async (on)=>{ els.enable.checked = !!on; await syncInputMode(); },
+    getState: ()=> ({ ...state }),
+  };
+
+  window.addEventListener("beforeunload", ()=>{
+    try { cancelAnimationFrame(state.rafId); } catch {}
+    try { stopCamera(); } catch {}
+    try { leaveArucoView(); } catch {}
+    try { generalApi()?.setNonContactRotateEnabled?.(false, "off"); } catch {}
+    try { generalApi()?.resetNonContactRotatePointer?.(); } catch {}
+  });
+
+  setLocalStatus("ready");
+  setStatus("cube tracking ready");
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,1141 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, state, scene, controls, renderer, dom, on, emit, libs } = viewer;
+  const { TransformControls } = libs;
+
+  // -----------------------------
+  // Constants
+  // -----------------------------
+  // three.js は distance=0 を「無限」と解釈するため、
+  // diameter=0 を "ゼロ" 扱いしたい場合は極小値に置換する
+  const EPS_DISTANCE = 1e-4;
+
+  // -----------------------------
+  // State
+  // -----------------------------
+  const ensureStateRoot = ()=>{
+    if (!state.lighting) state.lighting = {};
+    if (!state.lighting.lights){
+      state.lighting.lights = [
+        {
+          enabled: true,
+          type: "ambient",
+          intensity: 1.0,
+          color: { r: 255, g: 255, b: 255 },
+          pos: { x: 0, y: 0, z: 0 },
+          rot: { x: 0, y: 0, z: 0 },
+
+          // extras
+          spot: { angleDeg: 35, penumbra: 0.2, range: 0, decay: 2 }, // range=0 は infinite のまま
+          point:{ diameter: 0, decay: 2 }, // diameter=0 は「実質0」扱い（distance=EPS）
+          dir:  { attachedToCamera: false },
+        },
+        {
+          enabled: false,
+          type: "directional",
+          intensity: 2.0,
+          color: { r: 255, g: 255, b: 255 },
+          pos: { x: 0, y: 0, z: 0 },
+          rot: { x: 0, y: 0, z: 0 },
+
+          spot: { angleDeg: 35, penumbra: 0.2, range: 0, decay: 2 },
+          point:{ diameter: 0, decay: 2 },
+          dir:  { attachedToCamera: false },
+        },
+        {
+          enabled: false,
+          type: "directional",
+          intensity: 1.0,
+          color: { r: 255, g: 255, b: 255 },
+          pos: { x: 0, y: 0, z: 0 },
+          rot: { x: 0, y: 0, z: 0 },
+
+          spot: { angleDeg: 35, penumbra: 0.2, range: 0, decay: 2 },
+          point:{ diameter: 0, decay: 2 },
+          dir:  { attachedToCamera: false },
+        },
+      ];
+    }
+
+    // 既存データ互換（spot/point/dir が無い古いstateでも落ちないように）
+    for (const L of state.lighting.lights){
+      if (!L.spot)  L.spot  = { angleDeg: 35, penumbra: 0.2, range: 0, decay: 2 };
+      if (typeof L.spot.angleDeg !== "number") L.spot.angleDeg = 35;
+      if (typeof L.spot.penumbra !== "number") L.spot.penumbra = 0.2;
+      if (typeof L.spot.range !== "number")    L.spot.range = 0;   // 0 = infinite（SpotLightは仕様どおり）
+      if (typeof L.spot.decay !== "number")    L.spot.decay = 2;
+
+      if (!L.point) L.point = { diameter: 0, decay: 2 };
+      if (typeof L.point.diameter !== "number") L.point.diameter = 0;
+      if (typeof L.point.decay !== "number")    L.point.decay = 2;
+
+      if (!L.dir) L.dir = { attachedToCamera: false };
+      if (typeof L.dir.attachedToCamera !== "boolean") L.dir.attachedToCamera = false;
+    }
+
+    if (typeof state.lighting.selectedIndex !== "number") state.lighting.selectedIndex = 0;
+    if (!state.lighting.gizmoMode) state.lighting.gizmoMode = "translate"; // translate | rotate
+  };
+  ensureStateRoot();
+
+  // -----------------------------
+  // Runtime
+  // -----------------------------
+  const runtime = {
+    rigs: new Array(3).fill(null), // { group, light, target? }
+
+    // 2つのTransformControls（誤同時選択を防ぐため enabled を片方だけ true）
+    tMove: null,
+    tMoveHelper: null,
+    tRot: null,
+    tRotHelper: null,
+
+    dragging: false,
+
+    ui: {
+      rootBody: null,
+      cards: [], // { card, chk, selBtn, right, poseEl, extraEl }
+      btnMove: null,
+      btnRot: null,
+      btnAttach: null,
+      btnDetach: null,
+    },
+
+    lastUiSync: 0,
+  };
+
+  // -----------------------------
+  // Helpers
+  // -----------------------------
+  const clamp = (v, a, b)=> Math.max(a, Math.min(b, v));
+
+  // number入力中に value を上書きしないための補助
+  const isActive = (el)=> (document.activeElement === el);
+  const isIncompleteNumber = (s)=>{
+    const v = String(s ?? "").trim();
+    if (v === "" || v === "-" || v === "." || v === "-.") return true;
+    if (/[.eE+-]$/.test(v)) {
+      // "1." "1e" "1e-" など入力途中扱い
+      // ただし "1+" みたいな入力は通常起きにくいが安全側
+      // "1e+2" は末尾が数字なのでOK
+      return true;
+    }
+    return false;
+  };
+  const tryParseNumber = (s)=>{
+    if (isIncompleteNumber(s)) return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const rgbToHex = (r,g,b)=>{
+    const to2 = (n)=> n.toString(16).padStart(2,"0");
+    return "#" + to2(clamp(Math.round(r),0,255)) + to2(clamp(Math.round(g),0,255)) + to2(clamp(Math.round(b),0,255));
+  };
+  const hexToRgb = (hex)=>{
+    const h = (hex || "").replace("#","");
+    if (h.length !== 6) return { r:0,g:0,b:0 };
+    const n = parseInt(h, 16);
+    return { r:(n>>16)&255, g:(n>>8)&255, b:n&255 };
+  };
+  const colorToThree = (c)=> new THREE.Color((c.r||0)/255, (c.g||0)/255, (c.b||0)/255);
+
+  const eulerToDeg = (e)=>({
+    x: THREE.MathUtils.radToDeg(e.x),
+    y: THREE.MathUtils.radToDeg(e.y),
+    z: THREE.MathUtils.radToDeg(e.z),
+  });
+  const degToEuler = (d)=> new THREE.Euler(
+    THREE.MathUtils.degToRad(d.x||0),
+    THREE.MathUtils.degToRad(d.y||0),
+    THREE.MathUtils.degToRad(d.z||0),
+    "XYZ"
+  );
+
+  const spotDiameterAtRange = (angleDeg, range)=>{
+    const a = THREE.MathUtils.degToRad(clamp(angleDeg, 0.1, 89.9));
+    const d = Math.max(0, Number(range)||0);
+    if (d <= 0) return 0;
+    return 2 * d * Math.tan(a);
+  };
+  const spotAngleFromDiameter = (diameter, range)=>{
+    const d = Math.max(0, Number(range)||0);
+    const D = Math.max(0, Number(diameter)||0);
+    if (d <= 0) return 35;
+    const a = Math.atan((D * 0.5) / d); // rad
+    return THREE.MathUtils.radToDeg(a);
+  };
+
+  const isDirAttached = (L)=> (L?.type === "directional") && !!(L?.dir?.attachedToCamera);
+
+  // -----------------------------
+  // Light rig
+  // -----------------------------
+  function removeRig(i){
+    if (!runtime.rigs[i]) return;
+    scene.remove(runtime.rigs[i].group);
+    runtime.rigs[i] = null;
+  }
+
+  function makeRig(i){
+    const L = state.lighting.lights[i];
+
+    // preserve transform from existing rig if any
+    let prevPos = null, prevRot = null;
+    if (runtime.rigs[i]){
+      prevPos = runtime.rigs[i].group.position.clone();
+      prevRot = runtime.rigs[i].group.rotation.clone();
+    }
+
+    removeRig(i);
+
+    const group = new THREE.Group();
+    group.name = `LightRig_${i+1}`;
+    group.position.set(L.pos.x, L.pos.y, L.pos.z);
+    group.rotation.copy(degToEuler(L.rot));
+
+    // keep previous transform if existed (type swap)
+    if (prevPos) group.position.copy(prevPos);
+    if (prevRot) group.rotation.copy(prevRot);
+
+    let light = null;
+    let target = null;
+
+    if (L.type === "ambient"){
+      light = new THREE.AmbientLight(0xffffff, 1.0);
+      light.position.set(0,0,0);
+
+    } else if (L.type === "directional"){
+      light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0,0,0);
+
+      target = new THREE.Object3D();
+      target.name = `LightTarget_${i+1}`;
+      target.position.set(0, 0, -1);
+      group.add(target);
+      light.target = target;
+
+      // 初回だけ原点を見る（旧indexの雰囲気）
+      if (!prevRot && i === 1){
+        group.lookAt(0,0,0);
+      }
+
+    } else if (L.type === "point"){
+      // PointLight: UI=diameter(直径) → three.js=distance(半径)
+      const dia = Math.max(0, Number(L.point?.diameter)||0);
+      const dist = (dia <= 0) ? EPS_DISTANCE : (dia * 0.5);
+      const decay = Number(L.point?.decay);
+      light = new THREE.PointLight(
+        0xffffff,
+        1.0,
+        dist,
+        Number.isFinite(decay) ? Math.max(0, decay) : 2
+      );
+
+    } else if (L.type === "spot"){
+      const angleDeg = Number(L.spot?.angleDeg);
+      const pen = Number(L.spot?.penumbra);
+      const range = Number(L.spot?.range);
+      const decay = Number(L.spot?.decay);
+
+      light = new THREE.SpotLight(
+        0xffffff,
+        1.0,
+        Number.isFinite(range) ? Math.max(0, range) : 0, // 0=infinite（Spotはそのまま）
+        THREE.MathUtils.degToRad(Number.isFinite(angleDeg) ? angleDeg : 35),
+        Number.isFinite(pen) ? clamp(pen, 0, 1) : 0.2,
+        Number.isFinite(decay) ? Math.max(0, decay) : 2
+      );
+      light.position.set(0,0,0);
+
+      target = new THREE.Object3D();
+      target.name = `LightTarget_${i+1}`;
+      target.position.set(0, 0, -1);
+      group.add(target);
+      light.target = target;
+
+    } else {
+      light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(0,0,0);
+    }
+
+    group.add(light);
+    scene.add(group);
+
+    runtime.rigs[i] = { group, light, target };
+
+    // sync state from group (important after lookAt / preserved transform)
+    const deg = eulerToDeg(group.rotation);
+    L.pos.x = group.position.x; L.pos.y = group.position.y; L.pos.z = group.position.z;
+    L.rot.x = deg.x; L.rot.y = deg.y; L.rot.z = deg.z;
+
+    applyLight(i);
+  }
+
+  function applyLight(i){
+    const L = state.lighting.lights[i];
+    const rig = runtime.rigs[i];
+    if (!rig) return;
+
+    rig.group.visible = !!L.enabled;
+    rig.light.intensity = Number(L.intensity) || 0;
+    rig.light.color.copy(colorToThree(L.color));
+
+    // Directional が camera に attach のときは state.pos/rot で上書きしない
+    if (!isDirAttached(L)){
+      rig.group.position.set(L.pos.x, L.pos.y, L.pos.z);
+      rig.group.rotation.copy(degToEuler(L.rot));
+    }
+
+    // type-specific
+    if (L.type === "spot" && rig.light && rig.light.isSpotLight){
+      const angleDeg = Number(L.spot?.angleDeg);
+      const pen = Number(L.spot?.penumbra);
+      const range = Number(L.spot?.range);
+      const decay = Number(L.spot?.decay);
+
+      rig.light.angle = THREE.MathUtils.degToRad(clamp(Number.isFinite(angleDeg) ? angleDeg : 35, 0.1, 89.9));
+      rig.light.penumbra = clamp(Number.isFinite(pen) ? pen : 0.2, 0, 1);
+
+      rig.light.distance = Number.isFinite(range) ? Math.max(0, range) : 0;
+      rig.light.decay = Number.isFinite(decay) ? Math.max(0, decay) : 2;
+
+      if (rig.light.target) rig.light.target.updateMatrixWorld();
+
+    } else if (L.type === "point" && rig.light && rig.light.isPointLight){
+      const dia = Number(L.point?.diameter);
+      const decay = Number(L.point?.decay);
+
+      const d = (Number.isFinite(dia) ? Math.max(0, dia) : 0);
+      rig.light.distance = (d <= 0) ? EPS_DISTANCE : (d * 0.5);
+
+      rig.light.decay = Number.isFinite(decay) ? Math.max(0, decay) : 2;
+
+    } else if (L.type === "directional" && rig.light && rig.light.isDirectionalLight){
+      if (rig.light.target) rig.light.target.updateMatrixWorld();
+    }
+  }
+
+  function syncStateFromRig(i){
+    const L = state.lighting.lights[i];
+    const rig = runtime.rigs[i];
+    if (!rig) return;
+
+    // camera attach 中は state を汚さない
+    if (isDirAttached(L)) return;
+
+    L.pos.x = rig.group.position.x;
+    L.pos.y = rig.group.position.y;
+    L.pos.z = rig.group.position.z;
+
+    const deg = eulerToDeg(rig.group.rotation);
+    L.rot.x = deg.x; L.rot.y = deg.y; L.rot.z = deg.z;
+  }
+
+  // -----------------------------
+  // TransformControls utilities
+  // -----------------------------
+  function getHelperObject(tctrl){
+    if (!tctrl) return null;
+    if (tctrl.isObject3D || (tctrl instanceof THREE.Object3D)) return tctrl;
+    if (typeof tctrl.getHelper === "function") return tctrl.getHelper();
+    if (tctrl.helper && (tctrl.helper.isObject3D || tctrl.helper instanceof THREE.Object3D)) return tctrl.helper;
+    return null;
+  }
+
+  function filterHelperParts(helper, allowSet){
+    if (!helper || !helper.traverse) return;
+    const known = new Set([
+      "X","Y","Z","XY","YZ","XZ","XYZ",
+      "RX","RY","RZ","E","XYZE"
+    ]);
+    helper.traverse((o)=>{
+      if (!o || !o.name) return;
+      if (!known.has(o.name)) return;
+      o.visible = allowSet.has(o.name);
+    });
+  }
+
+  function applyGizmoShapes(){
+    if (runtime.tMoveHelper) filterHelperParts(runtime.tMoveHelper, new Set(["X","Y","Z","XY"]));
+    if (runtime.tRotHelper)  filterHelperParts(runtime.tRotHelper,  new Set(["RX","RY","RZ"]));
+  }
+
+  function hookDraggingEvents(tctrl){
+    tctrl.addEventListener?.("dragging-changed", (e)=>{
+      if (!tctrl.enabled) return;
+      runtime.dragging = !!e.value;
+      controls.enabled = !e.value;
+    });
+  }
+
+  function ensureTransformControls(){
+    if (runtime.tMove && runtime.tRot) return;
+
+    // move
+    if (!runtime.tMove){
+      const t = new TransformControls(controls.object, renderer.domElement);
+      t.setSpace?.("local");
+      t.setMode?.("translate");
+      hookDraggingEvents(t);
+
+      const helper = getHelperObject(t);
+      if (helper) scene.add(helper);
+
+      runtime.tMove = t;
+      runtime.tMoveHelper = helper;
+    }
+
+    // rotate
+    if (!runtime.tRot){
+      const t = new TransformControls(controls.object, renderer.domElement);
+      t.setSpace?.("local");
+      t.setMode?.("rotate");
+      hookDraggingEvents(t);
+
+      const helper = getHelperObject(t);
+      if (helper) scene.add(helper);
+
+      runtime.tRot = t;
+      runtime.tRotHelper = helper;
+    }
+
+    applyGizmoShapes();
+    applyGizmoModeFromState();
+  }
+
+  function applyGizmoModeFromState(){
+    const mode = state.lighting.gizmoMode; // translate | rotate
+    if (runtime.tMove) runtime.tMove.enabled = (mode === "translate");
+    if (runtime.tRot)  runtime.tRot.enabled  = (mode === "rotate");
+
+    // ★修正：見た目も片方だけに（重なり防止）
+    if (runtime.tMove) runtime.tMove.visible = (mode === "translate");
+    if (runtime.tRot)  runtime.tRot.visible  = (mode === "rotate");
+
+    styleModeButtons();
+  }
+
+  function setGizmoMode(mode){
+    state.lighting.gizmoMode = mode;
+    applyGizmoModeFromState();
+  }
+
+  function styleModeButtons(){
+    const onStyle = (b, on)=>{
+      if (!b) return;
+      b.style.borderColor = on ? "#777" : "var(--btnLine)";
+    };
+    onStyle(runtime.ui.btnMove, state.lighting.gizmoMode === "translate");
+    onStyle(runtime.ui.btnRot,  state.lighting.gizmoMode === "rotate");
+  }
+
+  function attachGizmoToSelected(){
+    ensureTransformControls();
+
+    const idx = state.lighting.selectedIndex;
+    const rig = runtime.rigs[idx];
+
+    if (!rig){
+      runtime.tMove?.detach?.();
+      runtime.tRot?.detach?.();
+      return;
+    }
+
+    const L = state.lighting.lights[idx];
+
+    // Ambient はギズモ無し
+    if (L.type === "ambient"){
+      runtime.tMove?.detach?.();
+      runtime.tRot?.detach?.();
+      return;
+    }
+
+    // Directional が camera attach 中はギズモ無効
+    if (isDirAttached(L)){
+      runtime.tMove?.detach?.();
+      runtime.tRot?.detach?.();
+      return;
+    }
+
+    runtime.tMove.attach(rig.group);
+    runtime.tRot.attach(rig.group);
+
+    applyGizmoShapes();
+    applyGizmoModeFromState();
+  }
+
+  function detachGizmo(){
+    ensureTransformControls();
+    runtime.tMove?.detach?.();
+    runtime.tRot?.detach?.();
+  }
+
+  // -----------------------------
+  // UI builders
+  // -----------------------------
+  const mkNumStyle = `width:100%;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);padding:8px 10px;border-radius:10px;font-size:12px;outline:none`;
+
+  function rebuildExtraUI(i){
+    const item = runtime.ui.cards[i];
+    if (!item) return;
+    const extra = item.extraEl;
+    if (!extra) return;
+
+    const L = state.lighting.lights[i];
+    extra.innerHTML = "";
+
+    // Directional extras
+    if (L.type === "directional"){
+      const wrap = document.createElement("div");
+      wrap.innerHTML = `
+        <div class="hint">Directional settings</div>
+        <label class="pill" style="display:flex;align-items:center;gap:8px;margin-top:6px">
+          <input id="dirAttach_${i}" type="checkbox" ${L.dir?.attachedToCamera ? "checked" : ""}>
+          attached to camera
+        </label>
+        <div class="hint" style="margin-top:6px">
+          ON: follows camera pose and lights camera forward direction.
+        </div>
+      `;
+      extra.appendChild(wrap);
+
+      const cb = extra.querySelector(`#dirAttach_${i}`);
+      cb.addEventListener("change", ()=>{
+        L.dir.attachedToCamera = !!cb.checked;
+
+        if (L.dir.attachedToCamera){
+          detachGizmo();
+        } else {
+          applyLight(i);
+          if (state.lighting.selectedIndex === i) attachGizmoToSelected();
+        }
+        refreshSelectLabels();
+      });
+    }
+
+    // Spot extras
+    if (L.type === "spot"){
+      const angleDeg = Number(L.spot?.angleDeg);
+      const pen = Number(L.spot?.penumbra);
+      const range = Number(L.spot?.range);
+      const decay = Number(L.spot?.decay);
+
+      const dComputed = spotDiameterAtRange(angleDeg, range);
+
+      const wrap = document.createElement("div");
+      wrap.innerHTML = `
+        <div class="hint">Spot settings</div>
+
+        <div class="field">
+          <label>Range</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="spRangeS_${i}" type="range" min="0" max="50" step="0.01" value="${Number.isFinite(range)?range:0}">
+            <input id="spRangeN_${i}" type="number" min="0" max="100000" step="0.01" value="${Number.isFinite(range)?range:0}" style="${mkNumStyle}">
+          </div>
+        </div>
+        <div class="hint" style="margin-top:-6px">Range is applied to SpotLight.distance（0はinfinite）</div>
+
+        <div class="field">
+          <label>Diameter</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="spDiaS_${i}" type="range" min="0" max="50" step="0.01" value="${dComputed}">
+            <input id="spDiaN_${i}" type="number" min="0" max="100000" step="0.01" value="${dComputed}" style="${mkNumStyle}">
+          </div>
+        </div>
+        <div class="hint" style="margin-top:-6px">Diameter is computed at Range. If Range=0, set Range first.</div>
+
+        <div class="field">
+          <label>Angle (°)</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="spAngS_${i}" type="range" min="0.1" max="89.9" step="0.1" value="${clamp(Number.isFinite(angleDeg)?angleDeg:35,0.1,89.9)}">
+            <input id="spAngN_${i}" type="number" min="0.1" max="89.9" step="0.1" value="${clamp(Number.isFinite(angleDeg)?angleDeg:35,0.1,89.9)}" style="${mkNumStyle}">
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Penumbra</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="spPenS_${i}" type="range" min="0" max="1" step="0.01" value="${clamp(Number.isFinite(pen)?pen:0.2,0,1)}">
+            <input id="spPenN_${i}" type="number" min="0" max="1" step="0.01" value="${clamp(Number.isFinite(pen)?pen:0.2,0,1)}" style="${mkNumStyle}">
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Decay</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="spDecS_${i}" type="range" min="0" max="4" step="0.1" value="${Number.isFinite(decay)?decay:2}">
+            <input id="spDecN_${i}" type="number" min="0" max="100" step="0.1" value="${Number.isFinite(decay)?decay:2}" style="${mkNumStyle}">
+          </div>
+        </div>
+      `;
+      extra.appendChild(wrap);
+
+      const spRangeS = extra.querySelector(`#spRangeS_${i}`);
+      const spRangeN = extra.querySelector(`#spRangeN_${i}`);
+      const spDiaS   = extra.querySelector(`#spDiaS_${i}`);
+      const spDiaN   = extra.querySelector(`#spDiaN_${i}`);
+      const spAngS   = extra.querySelector(`#spAngS_${i}`);
+      const spAngN   = extra.querySelector(`#spAngN_${i}`);
+      const spPenS   = extra.querySelector(`#spPenS_${i}`);
+      const spPenN   = extra.querySelector(`#spPenN_${i}`);
+      const spDecS   = extra.querySelector(`#spDecS_${i}`);
+      const spDecN   = extra.querySelector(`#spDecN_${i}`);
+
+      const syncSpotDisplays = ()=>{
+        const a = clamp(Number(L.spot.angleDeg)||35, 0.1, 89.9);
+        const r = Math.max(0, Number(L.spot.range)||0);
+        const D = spotDiameterAtRange(a, r);
+
+        spAngS.value = String(a);
+        if (!isActive(spAngN)) spAngN.value = String(a);
+
+        spRangeS.value = String(r);
+        if (!isActive(spRangeN)) spRangeN.value = String(r);
+
+        spDiaS.value = String(D);
+        if (!isActive(spDiaN)) spDiaN.value = String(D);
+
+        const disabled = (r <= 0);
+        spDiaS.disabled = disabled;
+        spDiaN.disabled = disabled;
+        spDiaS.style.opacity = disabled ? "0.5" : "1";
+        spDiaN.style.opacity = disabled ? "0.5" : "1";
+      };
+
+      const applySpotRange = (n, final=false)=>{
+        L.spot.range = Math.max(0, n||0);
+        spRangeS.value = String(L.spot.range);
+        if (final && !isActive(spRangeN)) spRangeN.value = String(L.spot.range);
+        syncSpotDisplays();
+        applyLight(i);
+      };
+
+      const applySpotAngle = (n, final=false)=>{
+        L.spot.angleDeg = clamp(n||35, 0.1, 89.9);
+        spAngS.value = String(L.spot.angleDeg);
+        if (final && !isActive(spAngN)) spAngN.value = String(L.spot.angleDeg);
+        syncSpotDisplays();
+        applyLight(i);
+      };
+
+      const applySpotDiameter = (n, final=false)=>{
+        const r = Math.max(0, Number(L.spot.range)||0);
+        if (r <= 0) { syncSpotDisplays(); return; }
+        const D = Math.max(0, n||0);
+        const a = clamp(spotAngleFromDiameter(D, r), 0.1, 89.9);
+        L.spot.angleDeg = a;
+
+        // 直径UIは計算値なので、確定時のみnumber側を更新（入力中は触らない）
+        syncSpotDisplays();
+        if (final){
+          const Dnow = spotDiameterAtRange(L.spot.angleDeg, r);
+          spDiaS.value = String(Dnow);
+          if (!isActive(spDiaN)) spDiaN.value = String(Dnow);
+        }
+        applyLight(i);
+      };
+
+      const applySpotPen = (n, final=false)=>{
+        L.spot.penumbra = clamp(n||0, 0, 1);
+        spPenS.value = String(L.spot.penumbra);
+        if (final && !isActive(spPenN)) spPenN.value = String(L.spot.penumbra);
+        applyLight(i);
+      };
+
+      const applySpotDecay = (n, final=false)=>{
+        L.spot.decay = Math.max(0, n||0);
+        spDecS.value = String(L.spot.decay);
+        if (final && !isActive(spDecN)) spDecN.value = String(L.spot.decay);
+        applyLight(i);
+      };
+
+      syncSpotDisplays();
+
+      // slider: 常に両方更新（確定扱い）
+      spRangeS.addEventListener("input", ()=> applySpotRange(Number(spRangeS.value), true));
+      spAngS.addEventListener("input", ()=> applySpotAngle(Number(spAngS.value), true));
+      spDiaS.addEventListener("input", ()=> applySpotDiameter(Number(spDiaS.value), true));
+      spPenS.addEventListener("input", ()=> applySpotPen(Number(spPenS.value), true));
+      spDecS.addEventListener("input", ()=> applySpotDecay(Number(spDecS.value), true));
+
+      // number: input中は自分自身を上書きしない、changeで確定
+      spRangeN.addEventListener("input", ()=>{
+        const n = tryParseNumber(spRangeN.value);
+        if (n === null) return;
+        applySpotRange(n, false);
+      });
+      spRangeN.addEventListener("change", ()=>{
+        const n = tryParseNumber(spRangeN.value);
+        if (n === null) { syncSpotDisplays(); return; }
+        applySpotRange(n, true);
+      });
+
+      spAngN.addEventListener("input", ()=>{
+        const n = tryParseNumber(spAngN.value);
+        if (n === null) return;
+        applySpotAngle(n, false);
+      });
+      spAngN.addEventListener("change", ()=>{
+        const n = tryParseNumber(spAngN.value);
+        if (n === null) { syncSpotDisplays(); return; }
+        applySpotAngle(n, true);
+      });
+
+      spDiaN.addEventListener("input", ()=>{
+        const n = tryParseNumber(spDiaN.value);
+        if (n === null) return;
+        applySpotDiameter(n, false);
+      });
+      spDiaN.addEventListener("change", ()=>{
+        const n = tryParseNumber(spDiaN.value);
+        if (n === null) { syncSpotDisplays(); return; }
+        applySpotDiameter(n, true);
+      });
+
+      spPenN.addEventListener("input", ()=>{
+        const n = tryParseNumber(spPenN.value);
+        if (n === null) return;
+        applySpotPen(n, false);
+      });
+      spPenN.addEventListener("change", ()=>{
+        const n = tryParseNumber(spPenN.value);
+        if (n === null) return;
+        applySpotPen(n, true);
+      });
+
+      spDecN.addEventListener("input", ()=>{
+        const n = tryParseNumber(spDecN.value);
+        if (n === null) return;
+        applySpotDecay(n, false);
+      });
+      spDecN.addEventListener("change", ()=>{
+        const n = tryParseNumber(spDecN.value);
+        if (n === null) return;
+        applySpotDecay(n, true);
+      });
+    }
+
+    // Point extras
+    if (L.type === "point"){
+      const dia = Number(L.point?.diameter);
+      const decay = Number(L.point?.decay);
+
+      const diaSafe = Number.isFinite(dia) ? Math.max(0, dia) : 0;
+      const decSafe = Number.isFinite(decay) ? Math.max(0, decay) : 2;
+
+      const wrap = document.createElement("div");
+      wrap.innerHTML = `
+        <div class="hint">Point settings</div>
+
+        <div class="field">
+          <label>Diameter</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="ptDiaS_${i}" type="range" min="0" max="10" step="0.01" value="${diaSafe}">
+            <input id="ptDiaN_${i}" type="number" min="0" max="10" step="0.01" value="${diaSafe}" style="${mkNumStyle}">
+          </div>
+        </div>
+        <div class="hint" style="margin-top:-6px">0 = practically off（internally: distance = EPS, not infinite）</div>
+
+        <div class="field">
+          <label>Decay</label>
+          <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+            <input id="ptDecS_${i}" type="range" min="0" max="4" step="0.1" value="${decSafe}">
+            <input id="ptDecN_${i}" type="number" min="0" max="100" step="0.1" value="${decSafe}" style="${mkNumStyle}">
+          </div>
+        </div>
+      `;
+      extra.appendChild(wrap);
+
+      const ptDiaS = extra.querySelector(`#ptDiaS_${i}`);
+      const ptDiaN = extra.querySelector(`#ptDiaN_${i}`);
+      const ptDecS = extra.querySelector(`#ptDecS_${i}`);
+      const ptDecN = extra.querySelector(`#ptDecN_${i}`);
+
+      const applyDia = (n, final=false)=>{
+        L.point.diameter = Math.max(0, n||0);
+        ptDiaS.value = String(L.point.diameter);
+        if (final && !isActive(ptDiaN)) ptDiaN.value = String(L.point.diameter);
+        applyLight(i);
+      };
+      const applyDecay = (n, final=false)=>{
+        L.point.decay = Math.max(0, n||0);
+        ptDecS.value = String(L.point.decay);
+        if (final && !isActive(ptDecN)) ptDecN.value = String(L.point.decay);
+        applyLight(i);
+      };
+
+      // slider: 確定扱い
+      ptDiaS.addEventListener("input", ()=> applyDia(Number(ptDiaS.value), true));
+      ptDecS.addEventListener("input", ()=> applyDecay(Number(ptDecS.value), true));
+
+      // number: input中は上書きしない、changeで確定
+      ptDiaN.addEventListener("input", ()=>{
+        const n = tryParseNumber(ptDiaN.value);
+        if (n === null) return;
+        applyDia(n, false);
+      });
+      ptDiaN.addEventListener("change", ()=>{
+        const n = tryParseNumber(ptDiaN.value);
+        if (n === null) return;
+        applyDia(n, true);
+      });
+
+      ptDecN.addEventListener("input", ()=>{
+        const n = tryParseNumber(ptDecN.value);
+        if (n === null) return;
+        applyDecay(n, false);
+      });
+      ptDecN.addEventListener("change", ()=>{
+        const n = tryParseNumber(ptDecN.value);
+        if (n === null) return;
+        applyDecay(n, true);
+      });
+    }
+  }
+
+  // -----------------------------
+  // UI
+  // -----------------------------
+  function buildUI(){
+    const sec = dom.secLighting;
+    if (!sec) return;
+
+    const body = sec.querySelector(".secBody");
+    body.innerHTML = "";
+    runtime.ui.rootBody = body;
+
+    // Top: attach/detach + mode
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const btnAttach = document.createElement("button");
+    btnAttach.textContent = "Select (Gizmo)";
+    btnAttach.title = "選択中ライトにギズモをアタッチ";
+    btnAttach.addEventListener("click", ()=>{
+      attachGizmoToSelected();
+      refreshSelectLabels();
+    });
+
+    const btnDetach = document.createElement("button");
+    btnDetach.textContent = "Detach";
+    btnDetach.title = "ギズモ解除";
+    btnDetach.addEventListener("click", ()=>{
+      detachGizmo();
+      refreshSelectLabels();
+    });
+
+    const btnMove = document.createElement("button");
+    btnMove.textContent = "Move";
+    btnMove.addEventListener("click", ()=> setGizmoMode("translate"));
+
+    const btnRot = document.createElement("button");
+    btnRot.textContent = "Rotate";
+    btnRot.addEventListener("click", ()=> setGizmoMode("rotate"));
+
+    runtime.ui.btnAttach = btnAttach;
+    runtime.ui.btnDetach = btnDetach;
+    runtime.ui.btnMove = btnMove;
+    runtime.ui.btnRot = btnRot;
+
+    row.appendChild(btnAttach);
+    row.appendChild(btnDetach);
+    row.appendChild(btnMove);
+    row.appendChild(btnRot);
+
+    body.appendChild(row);
+
+    // Cards 1..3
+    runtime.ui.cards = [];
+    for (let i=0;i<3;i++){
+      const L = state.lighting.lights[i];
+
+      const card = document.createElement("div");
+      card.className = "section";
+      card.style.marginTop = "10px";
+
+      const head = document.createElement("div");
+      head.className = "secHead";
+
+      const left = document.createElement("div");
+      left.style.display = "flex";
+      left.style.alignItems = "center";
+      left.style.gap = "8px";
+
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = !!L.enabled;
+
+      const title = document.createElement("span");
+      title.textContent = `Light ${i+1}`;
+
+      const selBtn = document.createElement("button");
+      selBtn.textContent = "Select";
+      selBtn.style.padding = "6px 8px";
+      selBtn.title = "このライトを選択（ギズモ対象）";
+
+      left.appendChild(chk);
+      left.appendChild(title);
+      left.appendChild(selBtn);
+
+      const right = document.createElement("span");
+      right.style.fontSize = "11px";
+      right.style.color = "var(--muted)";
+      right.textContent = "off";
+
+      head.appendChild(left);
+      head.appendChild(right);
+
+      const body2 = document.createElement("div");
+      body2.className = "secBody";
+
+      // Type
+      const fieldType = document.createElement("div");
+      fieldType.className = "field";
+      fieldType.innerHTML = `
+        <label>Type</label>
+        <select id="ltType_${i}">
+          <option value="ambient">Ambient</option>
+          <option value="directional">Directional</option>
+          <option value="point">Point</option>
+          <option value="spot">Spot</option>
+        </select>
+      `;
+
+      // Intensity
+      const fieldInt = document.createElement("div");
+      fieldInt.className = "field";
+      fieldInt.innerHTML = `
+        <label>Intensity</label>
+        <div style="display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center">
+          <input id="ltIntS_${i}" type="range" min="0" max="10" step="0.01" value="${L.intensity}">
+          <input id="ltIntN_${i}" type="number" min="0" max="1000" step="0.01" value="${L.intensity}"
+            style="${mkNumStyle}">
+        </div>
+      `;
+
+      // Color
+      const fieldCol = document.createElement("div");
+      fieldCol.className = "field";
+      fieldCol.innerHTML = `
+        <label>Color</label>
+        <div style="display:grid;grid-template-columns: 44px 1fr; gap:8px; align-items:center">
+          <input id="ltCol_${i}" type="color" value="${rgbToHex(L.color.r,L.color.g,L.color.b)}"
+            style="width:44px;height:34px;background:#0f0f0f;border:1px solid var(--line);border-radius:10px;padding:0;outline:none">
+          <div style="display:grid;grid-template-columns: 1fr 1fr 1fr; gap:8px">
+            <input id="ltR_${i}" type="number" min="0" max="255" step="1" value="${L.color.r}" style="${mkNumStyle}">
+            <input id="ltG_${i}" type="number" min="0" max="255" step="1" value="${L.color.g}" style="${mkNumStyle}">
+            <input id="ltB_${i}" type="number" min="0" max="255" step="1" value="${L.color.b}" style="${mkNumStyle}">
+          </div>
+        </div>
+        <div class="hint" style="grid-column: 1 / -1; margin-top: -4px">RGB (0–255)</div>
+      `;
+
+      // Extra container (directional/spot/point)
+      const extra = document.createElement("div");
+      extra.id = `ltExtra_${i}`;
+
+      // Pose
+      const pose = document.createElement("div");
+      pose.className = "hint";
+      pose.id = `ltPose_${i}`;
+      pose.textContent = `pos: (0,0,0) / rot: (0,0,0)`;
+
+      body2.appendChild(fieldType);
+      body2.appendChild(fieldInt);
+      body2.appendChild(fieldCol);
+      body2.appendChild(extra);
+      body2.appendChild(pose);
+
+      card.appendChild(head);
+      card.appendChild(body2);
+      body.appendChild(card);
+
+      const poseEl = card.querySelector(`#ltPose_${i}`);
+      runtime.ui.cards.push({ card, chk, selBtn, right, poseEl, extraEl: extra });
+
+      // Hook up events
+      const typeSel = card.querySelector(`#ltType_${i}`);
+      const intS = card.querySelector(`#ltIntS_${i}`);
+      const intN = card.querySelector(`#ltIntN_${i}`);
+
+      const col = card.querySelector(`#ltCol_${i}`);
+      const rN = card.querySelector(`#ltR_${i}`);
+      const gN = card.querySelector(`#ltG_${i}`);
+      const bN = card.querySelector(`#ltB_${i}`);
+
+      typeSel.value = L.type;
+
+      chk.addEventListener("change", ()=>{
+        state.lighting.lights[i].enabled = chk.checked;
+        applyLight(i);
+        refreshSelectLabels();
+      });
+
+      selBtn.addEventListener("click", ()=>{
+        state.lighting.selectedIndex = i;
+        attachGizmoToSelected();
+        rebuildExtraUI(i);
+        refreshSelectLabels();
+      });
+
+      typeSel.addEventListener("change", ()=>{
+        state.lighting.lights[i].type = typeSel.value;
+        if (!state.lighting.lights[i].dir) state.lighting.lights[i].dir = { attachedToCamera: false };
+        makeRig(i);
+        rebuildExtraUI(i);
+        if (state.lighting.selectedIndex === i) attachGizmoToSelected();
+        refreshSelectLabels();
+      });
+
+      // ★修正：number入力中は自分自身を上書きしない（changeで確定）
+      const applyIntensity = (n, final=false)=>{
+        const v = Math.max(0, Number(n) || 0);
+        state.lighting.lights[i].intensity = v;
+        intS.value = String(v);
+        if (final && !isActive(intN)) intN.value = String(v);
+        applyLight(i);
+      };
+
+      // sliderは確定扱い
+      intS.addEventListener("input", ()=> applyIntensity(intS.value, true));
+
+      // numberは入力中は上書きしない
+      intN.addEventListener("input", ()=>{
+        const n = tryParseNumber(intN.value);
+        if (n === null) return;
+        applyIntensity(n, false);
+      });
+      intN.addEventListener("change", ()=>{
+        const n = tryParseNumber(intN.value);
+        if (n === null) return;
+        applyIntensity(n, true);
+      });
+
+      const setColorFromRgb = ()=>{
+        const rr = clamp(Number(rN.value)||0, 0, 255);
+        const gg = clamp(Number(gN.value)||0, 0, 255);
+        const bb = clamp(Number(bN.value)||0, 0, 255);
+        state.lighting.lights[i].color = { r: rr, g: gg, b: bb };
+        col.value = rgbToHex(rr,gg,bb);
+        applyLight(i);
+      };
+      const setColorFromHex = ()=>{
+        const rgb = hexToRgb(col.value);
+        state.lighting.lights[i].color = rgb;
+        rN.value = String(rgb.r);
+        gN.value = String(rgb.g);
+        bN.value = String(rgb.b);
+        applyLight(i);
+      };
+
+      rN.addEventListener("input", setColorFromRgb);
+      gN.addEventListener("input", setColorFromRgb);
+      bN.addEventListener("input", setColorFromRgb);
+      col.addEventListener("input", setColorFromHex);
+
+      rebuildExtraUI(i);
+    }
+
+    styleModeButtons();
+    refreshSelectLabels();
+    updatePoseLabels(true);
+  }
+
+  function refreshSelectLabels(){
+    for (let i=0;i<runtime.ui.cards.length;i++){
+      const { right, card } = runtime.ui.cards[i];
+      const L = state.lighting.lights[i];
+      const isSel = (state.lighting.selectedIndex === i);
+
+      const att = isDirAttached(L) ? " (cam)" : "";
+      right.textContent = `${L.type}${att}${L.enabled ? "" : " (off)"}${isSel ? " [selected]" : ""}`;
+      card.style.borderColor = isSel ? "#555" : "var(--line)";
+    }
+  }
+
+  function updatePoseLabels(force=false){
+    const now = performance.now();
+    if (!force && (now - runtime.lastUiSync) < 80) return;
+    runtime.lastUiSync = now;
+
+    for (let i=0;i<3;i++){
+      const L = state.lighting.lights[i];
+      const rig = runtime.rigs[i];
+      const el = runtime.ui.cards[i]?.poseEl;
+      if (!el) continue;
+
+      // state へ書き戻し（ただし camera attach 中は書き戻さない）
+      syncStateFromRig(i);
+
+      const px = (rig?.group?.position.x ?? L.pos.x ?? 0).toFixed(2);
+      const py = (rig?.group?.position.y ?? L.pos.y ?? 0).toFixed(2);
+      const pz = (rig?.group?.position.z ?? L.pos.z ?? 0).toFixed(2);
+
+      const rotDeg = rig?.group ? eulerToDeg(rig.group.rotation) : L.rot;
+      const rx = (rotDeg.x||0).toFixed(1);
+      const ry = (rotDeg.y||0).toFixed(1);
+      const rz = (rotDeg.z||0).toFixed(1);
+
+      el.textContent = `pos: (${px}, ${py}, ${pz}) / rot: (${rx}°, ${ry}°, ${rz}°)`;
+    }
+  }
+
+  // -----------------------------
+  // Init
+  // -----------------------------
+  buildUI();
+
+  for (let i=0;i<3;i++){
+    makeRig(i);
+  }
+
+  attachGizmoToSelected();
+  refreshSelectLabels();
+
+  on("tick", ()=>{
+    const cam = controls.object;
+    if (runtime.tMove) runtime.tMove.camera = cam;
+    if (runtime.tRot)  runtime.tRot.camera  = cam;
+
+    {
+      const sel = state.lighting.selectedIndex;
+      const Lsel = state.lighting.lights[sel];
+      if (Lsel && isDirAttached(Lsel)){
+        runtime.tMove?.detach?.();
+        runtime.tRot?.detach?.();
+      }
+    }
+
+    for (let i = 0; i < 3; i++){
+      const L = state.lighting.lights[i];
+      const rig = runtime.rigs[i];
+      if (!L || !rig) continue;
+
+      if (L.enabled && isDirAttached(L)){
+        rig.group.position.copy(cam.position);
+        rig.group.quaternion.copy(cam.quaternion);
+        if (rig.light?.target) rig.light.target.updateMatrixWorld();
+      }
+
+      syncStateFromRig(i);
+      applyLight(i);
+    }
+
+    updatePoseLabels(false);
+  });
+
+  viewer.modules.lighting = {
+    attachGizmoToSelected,
+    detachGizmo,
+    setGizmoMode,
+    applyAll: ()=>{ for (let i=0;i<3;i++) applyLight(i); }
+  };
+}
+</script>
+</body>
+</html>

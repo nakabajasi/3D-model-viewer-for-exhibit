@@ -1,0 +1,874 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+import * as THREE from "three";
+
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+// OutputPass removed
+
+import { SAOPass } from "three/addons/postprocessing/SAOPass.js";
+import { BokehPass } from "three/addons/postprocessing/BokehPass.js";
+
+export default async function init(viewer){
+  const { dom, state, renderer, scene, controls, emit } = viewer;
+
+  // -----------------------------
+  // Helpers (Safety)
+  // -----------------------------
+  const d3 = (v)=> Math.round(v * 1000) / 1000;
+  const clamp = (v,a,b)=> Math.max(a, Math.min(b, v));
+  const num = (s)=> {
+    const v = Number(s);
+    return Number.isFinite(v) ? v : 0.0; 
+  };
+  const safeNum = (v, def = 0.0) => Number.isFinite(v) ? v : def;
+
+  // -----------------------------
+  // State Initialization
+  // -----------------------------
+  try {
+    if (!state.post) state.post = {};
+    if (!state.post.enabled) state.post.enabled = {};
+    if (!state.post.ssao) state.post.ssao = {};
+    if (!state.post.dof) state.post.dof = {};
+    if (!state.post.sharpness) state.post.sharpness = {};
+    if (!state.post.toneMapping) state.post.toneMapping = {};
+
+    const UI_MIN = 0.0;
+    const UI_MAX = 1.0;
+    const VAL_MIN = 0.001;
+    const VAL_MAX = 0.999;
+
+    if (typeof state.post.enabled.ssao !== "boolean") state.post.enabled.ssao = false;
+    if (typeof state.post.enabled.dof !== "boolean") state.post.enabled.dof = false;
+    if (typeof state.post.enabled.sharpness !== "boolean") state.post.enabled.sharpness = false;
+    
+    state.post.ssao.intensity = safeNum(state.post.ssao.intensity, 0.100);
+    state.post.ssao.radius    = safeNum(state.post.ssao.radius, 0.100);
+    state.post.ssao.bias      = safeNum(state.post.ssao.bias, 0.500);
+
+    // ★修正: 初期値を0.5に戻しました
+    state.post.dof.foreground = safeNum(state.post.dof.foreground, 0.500);
+    state.post.dof.background = safeNum(state.post.dof.background, 0.500);
+    state.post.dof.focusDist  = safeNum(state.post.dof.focusDist, 10.0);
+    
+    if (typeof state.post.dof.autoFocus !== "boolean") state.post.dof.autoFocus = true;
+    
+    state.post.sharpness.strength = safeNum(state.post.sharpness.strength, 0.2);
+
+    state.post.toneMapping.exposure   = safeNum(state.post.toneMapping.exposure, 1.0);
+    state.post.toneMapping.type       = safeNum(state.post.toneMapping.type, THREE.ACESFilmicToneMapping);
+    state.post.toneMapping.brightness = safeNum(state.post.toneMapping.brightness, 0.0);
+    state.post.toneMapping.contrast   = safeNum(state.post.toneMapping.contrast, 0.0);
+    state.post.toneMapping.saturation = safeNum(state.post.toneMapping.saturation, 1.0);
+
+    state.post.dof.isClickFocus = false;
+
+    state.post.ssao.intensity = d3(clamp(state.post.ssao.intensity, VAL_MIN, VAL_MAX));
+    state.post.ssao.radius    = d3(clamp(state.post.ssao.radius,    VAL_MIN, VAL_MAX));
+    state.post.ssao.bias      = d3(clamp(state.post.ssao.bias,      VAL_MIN, VAL_MAX));
+
+    state.post.dof.foreground = d3(clamp(state.post.dof.foreground, 0.0, UI_MAX));
+    state.post.dof.background = d3(clamp(state.post.dof.background, 0.0, UI_MAX));
+    state.post.dof.focusDist  = Math.max(0.1, state.post.dof.focusDist);
+    
+    state.post.sharpness.strength = Math.max(0.0, Math.min(5.0, state.post.sharpness.strength));
+  } catch(e) {
+    console.error("State Init Error:", e);
+  }
+
+  // -----------------------------
+  // Helpers
+  // -----------------------------
+  const commitInRange = (v)=>{
+      const VAL_MIN = 0.001;
+      const VAL_MAX = 0.999;
+      return Math.round(Math.max(VAL_MIN, Math.min(VAL_MAX, v)) * 1000) / 1000;
+  };
+  const reflect = (rangeEl, numEl, vv)=>{ 
+      if(!rangeEl || !numEl) return;
+      rangeEl.value = String(vv); 
+      numEl.value = vv.toFixed(3); 
+  };
+
+  // -----------------------------
+  // UI Generation
+  // -----------------------------
+  const sec = dom.secPostProcess;
+  if (!sec) return;
+  const body = sec.querySelector(".secBody");
+  if (!body) return;
+
+  let uiComponents = {}; 
+
+  try {
+    body.innerHTML = "";
+
+    const wrap = document.createElement("div");
+    wrap.style.display = "flex";
+    wrap.style.flexDirection = "column";
+    wrap.style.gap = "10px";
+
+    const makeToggle = (id, label, checked)=>{
+        const row = document.createElement("div");
+        row.className = "row";
+        row.style.justifyContent = "space-between";
+        row.style.alignItems = "center";
+        const lab = document.createElement("label");
+        lab.className = "pill";
+        lab.style.cursor = "pointer";
+        lab.innerHTML = `<input type="checkbox" id="${id}" ${checked ? "checked" : ""} /> ${label}`;
+        row.appendChild(lab);
+        return row;
+    };
+
+    const makeSubBox = ()=>{
+        const box = document.createElement("div");
+        box.style.border = "1px solid var(--line)";
+        box.style.borderRadius = "12px";
+        box.style.padding = "10px";
+        box.style.background = "rgba(0,0,0,.08)";
+        box.style.display = "flex";
+        box.style.flexDirection = "column";
+        box.style.gap = "10px";
+        return box;
+    };
+
+    const makeSliderNumber = ({ label, min, max, step, value, decimals })=>{
+        const row = document.createElement("div");
+        row.style.display = "grid";
+        row.style.gridTemplateColumns = "120px 1fr 74px";
+        row.style.gap = "8px";
+        row.style.alignItems = "center";
+
+        const lab = document.createElement("div");
+        lab.style.fontSize = "11px";
+        lab.style.color = "var(--muted)";
+        lab.textContent = label;
+
+        const valSafe = safeNum(value, min);
+
+        const range = document.createElement("input");
+        range.type = "range";
+        range.min = String(min);
+        range.max = String(max);
+        range.step = String(step);
+        range.value = String(valSafe);
+
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = valSafe.toFixed(decimals);
+        input.style.width = "100%";
+        input.style.background = "#0f0f0f";
+        input.style.border = "1px solid var(--line)";
+        input.style.color = "var(--fg)";
+        input.style.padding = "8px 10px";
+        input.style.borderRadius = "10px";
+        input.style.fontSize = "12px";
+        input.style.outline = "none";
+
+        row.appendChild(lab);
+        row.appendChild(range);
+        row.appendChild(input);
+
+        return { row, range, input };
+    };
+
+    const makeSelect = (label, options, selectedValue)=>{
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.justifyContent = "space-between";
+        row.style.alignItems = "center";
+        row.style.padding = "4px 0";
+
+        const lab = document.createElement("div");
+        lab.style.fontSize = "11px";
+        lab.style.color = "var(--muted)";
+        lab.textContent = label;
+
+        const sel = document.createElement("select");
+        sel.style.background = "#0f0f0f";
+        sel.style.border = "1px solid var(--line)";
+        sel.style.color = "var(--fg)";
+        sel.style.padding = "4px";
+        sel.style.borderRadius = "6px";
+        sel.style.fontSize = "12px";
+        sel.style.outline = "none";
+        sel.style.width = "140px";
+
+        options.forEach(opt => {
+            const el = document.createElement("option");
+            el.value = String(opt.value);
+            el.textContent = opt.label;
+            if(opt.value === selectedValue) el.selected = true;
+            sel.appendChild(el);
+        });
+
+        row.appendChild(lab);
+        row.appendChild(sel);
+        return { row, select: sel };
+    };
+
+    const rowSSAO  = makeToggle("ppSSAO",  "SSAO",           state.post.enabled.ssao);
+    const rowDOF   = makeToggle("ppDOF",   "Depth of Field",state.post.enabled.dof);
+    const rowSharp = makeToggle("ppSharp", "Sharpness",      state.post.enabled.sharpness);
+    
+    const rowTM    = document.createElement("div");
+    rowTM.className = "row pill";
+    rowTM.style.fontWeight = "bold";
+    rowTM.textContent = "Tone Mapping & Color";
+
+    wrap.appendChild(rowSSAO);
+    const ssaoBox = makeSubBox();
+    const uiIntensity = makeSliderNumber({ label:"Intensity", min:0.0, max:1.0, step:0.001, value:state.post.ssao.intensity, decimals:3 });
+    const uiRadius    = makeSliderNumber({ label:"Radius",    min:0.0, max:1.0, step:0.001, value:state.post.ssao.radius, decimals:3 });
+    const uiBias      = makeSliderNumber({ label:"Bias",      min:0.0, max:1.0, step:0.001, value:state.post.ssao.bias, decimals:3 });
+    ssaoBox.appendChild(uiIntensity.row);
+    ssaoBox.appendChild(uiRadius.row);
+    ssaoBox.appendChild(uiBias.row);
+    wrap.appendChild(ssaoBox);
+    
+    wrap.appendChild(rowDOF);
+    const dofBox = makeSubBox();
+    const rowAutoFocus = makeToggle("ppDOFAuto", "Auto Focus (Center)", state.post.dof.autoFocus);
+    rowAutoFocus.style.fontSize = "12px"; 
+    rowAutoFocus.style.marginBottom = "5px";
+    dofBox.appendChild(rowAutoFocus);
+
+    const uiFocusDist = makeSliderNumber({ label:"Focus Dist",      min:0.1,    max:100.0,  step:0.1,  value:state.post.dof.focusDist,  decimals:2 });
+    const uiFore      = makeSliderNumber({ label:"Foreground blur", min:0.0,    max:1.0, step:0.001, value:state.post.dof.foreground, decimals:3 });
+    const uiBack      = makeSliderNumber({ label:"Background blur", min:0.0,    max:1.0, step:0.001, value:state.post.dof.background, decimals:3 });
+    
+    dofBox.appendChild(uiFocusDist.row);
+    dofBox.appendChild(uiFore.row);
+    dofBox.appendChild(uiBack.row);
+    wrap.appendChild(dofBox);
+
+    wrap.appendChild(rowSharp);
+    const sharpBox = makeSubBox();
+    const uiSharpness = makeSliderNumber({ label:"Strength", min:0.0, max:5.0, step:0.1, value:state.post.sharpness.strength, decimals:2 });
+    sharpBox.appendChild(uiSharpness.row);
+    wrap.appendChild(sharpBox);
+
+    wrap.appendChild(rowTM);
+    const tmBox = makeSubBox();
+    
+    const tmOptions = [
+        { label: "ACES Filmic", value: THREE.ACESFilmicToneMapping },
+        { label: "Reinhard",    value: THREE.ReinhardToneMapping },
+        { label: "Cineon",      value: THREE.CineonToneMapping },
+        { label: "Linear",      value: THREE.LinearToneMapping },
+        { label: "None",        value: THREE.NoToneMapping }
+    ];
+    if(THREE.AgXToneMapping) tmOptions.unshift({ label: "AgX (Modern)", value: THREE.AgXToneMapping });
+
+    const uiTMType   = makeSelect("Type", tmOptions, state.post.toneMapping.type);
+    const uiExposure = makeSliderNumber({ label:"Exposure",   min:0.0, max:5.0, step:0.01, value:state.post.toneMapping.exposure, decimals:3 });
+    const uiBright   = makeSliderNumber({ label:"Brightness", min:-1.0, max:1.0, step:0.01, value:state.post.toneMapping.brightness, decimals:2 });
+    const uiContrast = makeSliderNumber({ label:"Contrast",   min:-1.0, max:1.0, step:0.01, value:state.post.toneMapping.contrast, decimals:2 });
+    const uiSaturate = makeSliderNumber({ label:"Saturation", min:0.0,  max:2.0, step:0.01, value:state.post.toneMapping.saturation, decimals:2 });
+
+    tmBox.appendChild(uiTMType.row);
+    tmBox.appendChild(uiExposure.row);
+    tmBox.appendChild(uiBright.row);
+    tmBox.appendChild(uiContrast.row);
+    tmBox.appendChild(uiSaturate.row);
+    wrap.appendChild(tmBox);
+    
+    body.appendChild(wrap);
+
+    uiComponents = {
+        rowSSAO, rowDOF, rowAutoFocus, rowSharp,
+        uiIntensity, uiRadius, uiBias,
+        dofBox, uiFocusDist, uiFore, uiBack,
+        sharpBox, uiSharpness,
+        uiTMType, uiExposure, uiBright, uiContrast, uiSaturate
+    };
+
+  } catch(e) {
+    console.error("UI Generation Error:", e);
+    body.innerHTML = "<div style='color:red'>PostProcess UI Error. Check Console.</div>";
+    return;
+  }
+
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace; 
+
+  // -----------------------------
+  // Composer + Passes
+  // -----------------------------
+  const composer = new EffectComposer(renderer);
+
+  const renderPass = new RenderPass(scene, controls.object);
+  composer.addPass(renderPass);
+
+  const saoPass = new SAOPass(
+      scene, 
+      controls.object, 
+      false, 
+      true, 
+      new THREE.Vector2(window.innerWidth, window.innerHeight)
+  );
+  const SAO_OUTPUT_DEFAULT = (SAOPass.OUTPUT && (SAOPass.OUTPUT.Default ?? SAOPass.OUTPUT.Beauty ?? 0)) ?? 0;
+  saoPass.params.output = SAO_OUTPUT_DEFAULT;
+  saoPass.params.saoScale = 10.0;      
+  saoPass.params.saoBlur = true;
+  saoPass.params.saoBlurRadius = 8;
+  saoPass.params.saoBlurStdDev = 4;
+  saoPass.params.saoBlurDepthCutoff = 0.05;
+  composer.addPass(saoPass);
+
+  // Bokeh
+  const bokehPass = new BokehPass(scene, controls.object, {
+    focus: 1.0, 
+    aperture: 0.00002, 
+    maxblur: 0.01 
+  });
+  
+  const bokehMat = bokehPass.materialBokeh;
+
+  if(bokehMat){
+      bokehMat.uniforms.uFgScale = { value: 1.0 };
+      bokehMat.uniforms.uBgScale = { value: 1.0 };
+
+      bokehMat.fragmentShader = bokehMat.fragmentShader.replace(
+          "void main() {",
+          "uniform float uFgScale; uniform float uBgScale; void main() {"
+      );
+      
+      // ★修正: ご指示頂いた「完璧なロジック」に復元し、両方のスライダーが正しく機能するようにしました。
+      // factor < 0.0 (奥/Background) -> uBgScale
+      // factor > 0.0 (手前/Foreground) -> uFgScale
+      bokehMat.fragmentShader = bokehMat.fragmentShader.replace(
+          "vec2 dofblur = vec2 ( clamp( factor * aperture, -maxblur, maxblur ) );",
+          `
+          float fScale = (factor < 0.0) ? uBgScale : uFgScale;
+          vec2 dofblur = vec2 ( clamp( factor * aperture * fScale, -maxblur, maxblur ) );
+          `
+      );
+
+      // ★ 3rd replace: CoC-based scatter-as-gather でエッジにじみを除去
+      //
+      // 原因: 背景をボケさせる際に前景ピクセルをサンプルすると、
+      //        その前景は実際にはシャープ(CoC小)なのに均等に混合され、
+      //        輪郭周辺ににじみが発生する。
+      //
+      // 対策: Scatter-as-Gather原理に基づく重み付け:
+      //   - 各サンプル位置のCoC(ボケ半径)も計算する
+      //   - サンプルのCoCが「中心ピクセルまで届く距離」より小さければ
+      //     そのサンプルは中心に寄与しない(光が届かない)
+      //   - 71サンプルの黄金角スパイラルで均一なディスク分布を実現
+      //   - getViewZ(), getDepth() は元のBokehShaderに定義済み
+      {
+        const src = bokehMat.fragmentShader;
+        const startMark = "vec4 col = vec4( 0.0 );";
+        const endMark   = "gl_FragColor.a = 1.0;";
+        const si = src.indexOf(startMark);
+        const ei = src.indexOf(endMark);
+        if(si !== -1 && ei !== -1){
+          const before = src.substring(0, si);
+          const after  = src.substring(ei + endMark.length);
+          bokehMat.fragmentShader = before + `
+          // == Optimized CoC-aware Bokeh with Adaptive Golden Spiral ==
+          float centerVZ  = viewZ;
+          float centerCoC = abs(dofblur.x);
+
+          // シャープな元画像を先に取得 (ブレンド用)
+          vec4 sharpColor = texture2D(tColor, vUv.xy);
+
+          // ---- Early exit: 完全フォーカス領域のみスキップ ----
+          if (centerCoC < 0.001) {
+              gl_FragColor = sharpColor;
+              gl_FragColor.a = 1.0;
+          } else {
+
+          vec4 col = vec4(0.0);
+          float tw = 0.0;
+
+          // center sample (常にフル寄与)
+          col += sharpColor;
+          tw += 1.0;
+
+          // プリコンピュート
+          float apBg = aperture * uBgScale;
+          float apFg = aperture * uFgScale;
+          float sharpCenterMask = 1.0 - smoothstep(0.001, 0.003, centerCoC);
+
+          const float GA = 2.39996323;
+          const float fN = 71.0;
+          const float invN = 1.0 / 71.0;
+
+          #define BOKEH_SAMPLE(idx) { \\
+              float fi = float(idx) + 0.5; \\
+              float r = sqrt(fi * invN); \\
+              float theta = fi * GA; \\
+              vec2 offset = vec2(cos(theta), sin(theta)) * r * aspectcorrect * dofblur; \\
+              vec2 sUv = vUv.xy + offset; \\
+              float sVZ = getViewZ(getDepth(sUv)); \\
+              float sFactor = focus + sVZ; \\
+              float sAp = mix(apFg, apBg, step(sFactor, 0.0)); \\
+              float sCoC = abs(clamp(sFactor * sAp, -maxblur, maxblur)); \\
+              float dist = r * centerCoC; \\
+              float gatherW = smoothstep(0.0, centerCoC + 0.0005, centerCoC); \\
+              float scatterW = smoothstep(dist * 0.8, dist * 1.2 + 0.0002, sCoC); \\
+              float w = max(gatherW, scatterW); \\
+              float depthDiff = sVZ - centerVZ; \\
+              float fgMask = smoothstep(0.1, 0.5, depthDiff); \\
+              float fgLeak = smoothstep(0.0, dist * 1.5 + 0.001, sCoC); \\
+              w *= mix(1.0, fgLeak, fgMask); \\
+              float farMask = (1.0 - smoothstep(-2.0, -0.5, depthDiff)) * sharpCenterMask; \\
+              w *= mix(1.0, 0.08, farMask); \\
+              w = max(w, 0.015); \\
+              col += texture2D(tColor, sUv) * w; \\
+              tw += w; \\
+          }
+
+          // ==== Tier 1: 24 samples (常に実行) ====
+          BOKEH_SAMPLE(0)  BOKEH_SAMPLE(1)  BOKEH_SAMPLE(2)  BOKEH_SAMPLE(3)
+          BOKEH_SAMPLE(4)  BOKEH_SAMPLE(5)  BOKEH_SAMPLE(6)  BOKEH_SAMPLE(7)
+          BOKEH_SAMPLE(8)  BOKEH_SAMPLE(9)  BOKEH_SAMPLE(10) BOKEH_SAMPLE(11)
+          BOKEH_SAMPLE(12) BOKEH_SAMPLE(13) BOKEH_SAMPLE(14) BOKEH_SAMPLE(15)
+          BOKEH_SAMPLE(16) BOKEH_SAMPLE(17) BOKEH_SAMPLE(18) BOKEH_SAMPLE(19)
+          BOKEH_SAMPLE(20) BOKEH_SAMPLE(21) BOKEH_SAMPLE(22) BOKEH_SAMPLE(23)
+
+          // ==== Tier 2: +24 samples (中〜強ボケ) ====
+          if (centerCoC >= 0.012) {
+          BOKEH_SAMPLE(24) BOKEH_SAMPLE(25) BOKEH_SAMPLE(26) BOKEH_SAMPLE(27)
+          BOKEH_SAMPLE(28) BOKEH_SAMPLE(29) BOKEH_SAMPLE(30) BOKEH_SAMPLE(31)
+          BOKEH_SAMPLE(32) BOKEH_SAMPLE(33) BOKEH_SAMPLE(34) BOKEH_SAMPLE(35)
+          BOKEH_SAMPLE(36) BOKEH_SAMPLE(37) BOKEH_SAMPLE(38) BOKEH_SAMPLE(39)
+          BOKEH_SAMPLE(40) BOKEH_SAMPLE(41) BOKEH_SAMPLE(42) BOKEH_SAMPLE(43)
+          BOKEH_SAMPLE(44) BOKEH_SAMPLE(45) BOKEH_SAMPLE(46) BOKEH_SAMPLE(47)
+
+          // ==== Tier 3: +23 samples (強ボケのみ) ====
+          if (centerCoC >= 0.025) {
+          BOKEH_SAMPLE(48) BOKEH_SAMPLE(49) BOKEH_SAMPLE(50) BOKEH_SAMPLE(51)
+          BOKEH_SAMPLE(52) BOKEH_SAMPLE(53) BOKEH_SAMPLE(54) BOKEH_SAMPLE(55)
+          BOKEH_SAMPLE(56) BOKEH_SAMPLE(57) BOKEH_SAMPLE(58) BOKEH_SAMPLE(59)
+          BOKEH_SAMPLE(60) BOKEH_SAMPLE(61) BOKEH_SAMPLE(62) BOKEH_SAMPLE(63)
+          BOKEH_SAMPLE(64) BOKEH_SAMPLE(65) BOKEH_SAMPLE(66) BOKEH_SAMPLE(67)
+          BOKEH_SAMPLE(68) BOKEH_SAMPLE(69) BOKEH_SAMPLE(70)
+          } // tier3
+          } // tier2
+
+          vec4 bokehColor = col / tw;
+
+          // ---- ソフトブレンドゾーン ----
+          // CoC 0.001〜0.012 の領域で シャープ→ボケ を滑らかに遷移
+          // これにより境界が柔らかくなる
+          float blendFactor = smoothstep(0.001, 0.012, centerCoC);
+          gl_FragColor = mix(sharpColor, bokehColor, blendFactor);
+          gl_FragColor.a = 1.0;
+          } // early exit else
+          ` + after;
+        } else {
+          console.warn("BokehShader depth-aware patch: markers not found, skipping.");
+        }
+      }
+      bokehMat.needsUpdate = true;
+  }
+  composer.addPass(bokehPass);
+
+  const SharpenShader = {
+    uniforms: { tDiffuse: { value: null }, resolution: { value: new THREE.Vector2(1, 1) }, strength: { value: 0.35 } },
+    vertexShader: `varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+    fragmentShader: `varying vec2 vUv;uniform sampler2D tDiffuse;uniform vec2 resolution;uniform float strength;void main(){vec2 texel=1.0/resolution;vec3 c=texture2D(tDiffuse,vUv).rgb;vec3 n=texture2D(tDiffuse,vUv+vec2(0.0,texel.y)).rgb;vec3 s=texture2D(tDiffuse,vUv-vec2(0.0,texel.y)).rgb;vec3 e=texture2D(tDiffuse,vUv+vec2(texel.x,0.0)).rgb;vec3 w=texture2D(tDiffuse,vUv-vec2(texel.x,0.0)).rgb;vec3 lap=(n+s+e+w-4.0*c);gl_FragColor=vec4(c-strength*lap,1.0);}`
+  };
+  const sharpPass = new ShaderPass(SharpenShader);
+  composer.addPass(sharpPass);
+
+  const FinalShader = {
+    defines: {
+        TONE_MAPPING: THREE.NoToneMapping
+    },
+    uniforms: { 
+        tDiffuse:   { value: null }, 
+        toneMappingExposure: { value: 1.0 },
+        brightness: { value: 0.0 }, 
+        contrast:   { value: 0.0 }, 
+        saturation: { value: 1.0 } 
+    },
+    vertexShader: `varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform sampler2D tDiffuse;
+      uniform float brightness;
+      uniform float contrast;
+      uniform float saturation;
+      #include <tonemapping_pars_fragment>
+      vec3 customToneMapping( vec3 color ) {
+        #if TONE_MAPPING == 0 
+            return color;
+        #elif TONE_MAPPING == 1 
+            return LinearToneMapping( color );
+        #elif TONE_MAPPING == 2 
+            return ReinhardToneMapping( color );
+        #elif TONE_MAPPING == 3 
+            return CineonToneMapping( color );
+        #elif TONE_MAPPING == 4 
+            return ACESFilmicToneMapping( color );
+        #elif TONE_MAPPING == 6 
+            return AgXToneMapping( color );
+        #else
+            return color;
+        #endif
+      }
+      vec3 LinearToSRGB(vec3 c) {
+          return mix(pow(c, vec3(0.41666)) * 1.055 - vec3(0.055), c * 12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
+      }
+      void main(){
+        vec4 tex = texture2D(tDiffuse, vUv);
+        vec3 c = tex.rgb;
+        c *= toneMappingExposure;
+        c = customToneMapping( c );
+        c = LinearToSRGB(c);
+        c += brightness;
+        c = (c - 0.5) * (1.0 + contrast) + 0.5;
+        float gray = dot(c, vec3(0.299, 0.587, 0.114));
+        c = mix(vec3(gray), c, saturation);
+        gl_FragColor = vec4(c, tex.a);
+      }
+    `
+  };
+  const finalPass = new ShaderPass(FinalShader);
+  composer.addPass(finalPass);
+
+  const { 
+    rowSSAO, rowDOF, rowAutoFocus, rowSharp,
+    uiIntensity, uiRadius, uiBias,
+    dofBox, uiFocusDist, uiFore, uiBack,
+    sharpBox, uiSharpness,
+    uiTMType, uiExposure, uiBright, uiContrast, uiSaturate
+  } = uiComponents;
+
+  const effectiveSSAOEnabled = ()=> !!state.post.enabled.ssao;
+  const effectiveDOFEnabled  = ()=> !!state.post.enabled.dof;
+
+  const applyEnableStates = ()=>{
+    const ssaoOn = !!state.post.enabled.ssao;
+    const elSSAO = rowSSAO.querySelector("input");
+    if(elSSAO) elSSAO.checked = ssaoOn;
+
+    [uiIntensity.range, uiIntensity.input, uiRadius.range, uiRadius.input, uiBias.range, uiBias.input].forEach(el=>{
+        el.disabled = !ssaoOn; el.style.opacity = ssaoOn ? "1" : ".5";
+    });
+    
+    const dofOn = effectiveDOFEnabled();
+    const elDOF = rowDOF.querySelector("input");
+    if(elDOF) elDOF.checked = dofOn;
+
+    dofBox.style.opacity = dofOn ? "1" : ".5";
+    const autoFocus = state.post.dof.autoFocus;
+
+    uiFocusDist.range.disabled = !dofOn;
+    uiFocusDist.input.disabled = !dofOn;
+    uiFocusDist.row.style.opacity = (!dofOn) ? "0.5" : "1";
+
+    const elDOFAuto = rowAutoFocus.querySelector("input");
+    if(elDOFAuto) elDOFAuto.disabled = !dofOn;
+
+    [uiFore.range, uiFore.input, uiBack.range, uiBack.input].forEach(el=>{
+        el.disabled = !dofOn; el.style.opacity = dofOn ? "1" : ".5";
+    });
+
+    const sharpOn = !!state.post.enabled.sharpness;
+    const elSharp = rowSharp.querySelector("input");
+    if(elSharp) elSharp.checked = sharpOn;
+
+    sharpBox.style.opacity = sharpOn ? "1" : ".5";
+    uiSharpness.range.disabled = !sharpOn;
+    uiSharpness.input.disabled = !sharpOn;
+
+    saoPass.enabled = effectiveSSAOEnabled();
+    sharpPass.enabled = !!state.post.enabled.sharpness;
+  };
+
+  const syncSSAOToPass = ()=>{
+    saoPass.params.output = SAO_OUTPUT_DEFAULT;
+    saoPass.params.saoIntensity = state.post.ssao.intensity * 0.15; 
+    saoPass.params.saoKernelRadius = state.post.ssao.radius * 30.0; 
+    saoPass.params.saoBias = 0.001 + (state.post.ssao.bias * 10.0);
+    saoPass.enabled = effectiveSSAOEnabled();
+    emit("postprocess/ssao", { ...state.post.ssao });
+  };
+
+  const syncDOFToPass = ()=>{
+    const bg = state.post.dof.background; 
+    const fg = state.post.dof.foreground;
+    
+    const cam = renderPass.camera;
+    let apertureBase = 0.005; 
+
+    if (cam && cam.isPerspectiveCamera) {
+       const fovRad = THREE.MathUtils.degToRad(cam.fov);
+       apertureBase = 0.0125 * (Math.tan(THREE.MathUtils.degToRad(45)*0.5) / Math.tan(fovRad*0.5));
+    }
+
+    bokehPass.uniforms["aperture"].value = apertureBase; 
+    bokehPass.uniforms["maxblur"].value = 0.05;
+
+    if(bokehMat && bokehMat.uniforms.uFgScale){
+        bokehMat.uniforms.uFgScale.value = fg; 
+        bokehMat.uniforms.uBgScale.value = bg; 
+    }
+    
+    if(!state.post.dof.autoFocus){
+       bokehPass.uniforms["focus"].value = state.post.dof.focusDist;
+    }
+    emit("postprocess/dof", { ...state.post.dof });
+  };
+
+  const syncSharpnessToPass = ()=>{
+      const val = state.post.sharpness.strength;
+      sharpPass.uniforms.strength.value = val;
+      emit("postprocess/sharpness", { strength: val });
+  };
+
+  const syncToneToPass = ()=>{
+      const { exposure, type, brightness, contrast, saturation } = state.post.toneMapping;
+      finalPass.uniforms.toneMappingExposure.value = exposure;
+      finalPass.uniforms.brightness.value = brightness;
+      finalPass.uniforms.contrast.value   = contrast;
+      finalPass.uniforms.saturation.value = saturation;
+
+      if(finalPass.material.defines.TONE_MAPPING !== type){
+          finalPass.material.defines.TONE_MAPPING = type;
+          finalPass.material.needsUpdate = true;
+      }
+      emit("postprocess/tonemapping", { ...state.post.toneMapping });
+  };
+
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const tmpVec = new THREE.Vector3();
+
+  // 深度バッファからクリック位置のフォーカス距離を取得 (レイキャスト失敗時のフォールバック)
+  const _depthPixelBuf = new Uint8Array(4);
+  const readDepthAtUV = (uvX, uvY) => {
+      const rt = bokehPass._renderTargetDepth;
+      if (!rt || rt.width < 1 || rt.height < 1) return null;
+      const cam = renderPass.camera;
+      if (!cam || !cam.isPerspectiveCamera) return null;
+
+      const px = Math.max(0, Math.min(Math.floor(uvX * rt.width), rt.width - 1));
+      // WebGL座標系はY反転
+      const py = Math.max(0, Math.min(Math.floor((1.0 - uvY) * rt.height), rt.height - 1));
+
+      renderer.readRenderTargetPixels(rt, px, py, 1, 1, _depthPixelBuf);
+
+      // MeshDepthMaterial (RGBADepthPacking) の unpack
+      // Three.js の packing.glsl と同一ロジック
+      const r = _depthPixelBuf[0] / 255.0;
+      const g = _depthPixelBuf[1] / 255.0;
+      const b = _depthPixelBuf[2] / 255.0;
+      const a = _depthPixelBuf[3] / 255.0;
+      const UnpackDownscale = 255.0 / 256.0;
+      const depth = UnpackDownscale * (
+          r / (256.0 * 256.0 * 256.0) +
+          g / (256.0 * 256.0) +
+          b / 256.0 +
+          a
+      );
+
+      // depth ≈ 1.0 はクリアカラー (ジオメトリ無し = far plane)
+      if (depth > 0.9999) return null;
+
+      // perspectiveDepthToViewZ: NDC depth → view-space Z
+      const near = cam.near;
+      const far  = cam.far;
+      const viewZ = near * far / ((far - near) * depth - far);
+      const dist = -viewZ;
+
+      // 妥当な範囲チェック
+      if (!Number.isFinite(dist) || dist <= near || dist >= far) return null;
+      return dist;
+  };
+
+  const applyClickFocus = (zDist) => {
+      state.post.dof.focusDist = zDist;
+      state.post.dof.isClickFocus = true;
+      reflect(uiFocusDist.range, uiFocusDist.input, zDist);
+      applyEnableStates();
+      syncDOFToPass();
+  };
+
+  const onClickCanvas = (ev)=>{
+    if(!effectiveDOFEnabled()) return;
+    const canvas = renderer.domElement; 
+    const rect = canvas.getBoundingClientRect();
+    const uvX = (ev.clientX - rect.left) / rect.width;
+    const uvY = (ev.clientY - rect.top)  / rect.height;
+    mouse.x =  uvX * 2 - 1;
+    mouse.y = -uvY * 2 + 1;
+
+    // 1st: レイキャスト (最も正確)
+    raycaster.setFromCamera(mouse, renderPass.camera);
+    const intersects = raycaster.intersectObjects(scene.children, true).filter(hit => hit.object.visible);
+    if(intersects.length > 0){
+        const hit = intersects[0];
+        tmpVec.copy(hit.point);
+        tmpVec.applyMatrix4(renderPass.camera.matrixWorldInverse);
+        applyClickFocus(-tmpVec.z);
+        return;
+    }
+
+    // 2nd: 深度バッファフォールバック (ジオメトリがない箇所でも動作)
+    const depthDist = readDepthAtUV(uvX, uvY);
+    if(depthDist !== null){
+        applyClickFocus(depthDist);
+    }
+  };
+  if(renderer.domElement){
+      renderer.domElement.addEventListener("click", onClickCanvas);
+  }
+
+  viewer.setRenderFn((_scn, cam)=>{
+    renderPass.camera = cam;
+    saoPass.camera = cam;
+    bokehPass.camera = cam;
+    const wantDof = effectiveDOFEnabled();
+    const canDof = !!(cam && cam.isPerspectiveCamera);
+    bokehPass.enabled = wantDof && canDof;
+
+    if(canDof && wantDof){
+        if(state.post.dof.autoFocus){
+            if (!state.post.dof.isClickFocus && controls.target) {
+                 tmpVec.copy(controls.target);
+                 tmpVec.applyMatrix4(cam.matrixWorldInverse);
+                 const dist = -tmpVec.z;
+                 bokehPass.uniforms["focus"].value = dist;
+                 if(Math.abs(state.post.dof.focusDist - dist) > 0.1){
+                     state.post.dof.focusDist = dist;
+                     reflect(uiFocusDist.range, uiFocusDist.input, dist);
+                 }
+            } else {
+                 bokehPass.uniforms["focus"].value = state.post.dof.focusDist;
+            }
+        } else {
+             bokehPass.uniforms["focus"].value = state.post.dof.focusDist;
+        }
+        syncDOFToPass();
+    }
+    composer.render();
+  });
+
+  viewer.notifyResize = (w,h)=>{
+    composer.setSize(w, h);
+    if(saoPass.resolution) saoPass.resolution.set(w, h);
+    sharpPass.uniforms.resolution.value.set(Math.max(1,w), Math.max(1,h));
+  };
+  {
+    const sideW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--sideW")) || 380;
+    const viewW = Math.max(1, window.innerWidth - sideW);
+    const viewH = Math.max(1, window.innerHeight);
+    viewer.notifyResize(viewW, viewH);
+  }
+
+  const bind = (rangeEl, numEl, obj, key, syncFn)=>{
+    const commit = (v)=>{
+      const vv = commitInRange(v);
+      obj[key] = vv;
+      reflect(rangeEl, numEl, vv);
+      syncFn();
+    };
+    rangeEl.addEventListener("input", ()=>{
+        const v = num(rangeEl.value); if(!Number.isFinite(v)) return; commit(v);
+    });
+    numEl.addEventListener("input", ()=>{
+        const v = num(numEl.value); if(!Number.isFinite(v)) return; rangeEl.value = String(d3(clamp(v, 0.0, 1.0)));
+    });
+    numEl.addEventListener("change", ()=>{
+      const v = num(numEl.value); if(!Number.isFinite(v)){ reflect(rangeEl, numEl, obj[key]); return; } commit(v);
+    });
+  };
+  
+  const bindCustom = (ui, obj, key, min, max, syncFn)=>{
+      const { range, input } = ui;
+      const commit = (v)=>{
+          const vv = Math.max(min, Math.min(max, v));
+          obj[key] = Math.round(vv*1000)/1000;
+          range.value = String(obj[key]);
+          input.value = obj[key].toFixed(3);
+          syncFn();
+      };
+      range.addEventListener("input", ()=>{
+          const v = num(range.value); if(!Number.isFinite(v)) return; commit(v);
+      });
+      input.addEventListener("change", ()=>{
+           const v = num(input.value); if(!Number.isFinite(v)) return; commit(v);
+      });
+  };
+
+  const bindFocusDist = ()=>{
+      const { range, input } = uiFocusDist;
+      const commit = (v)=>{
+          state.post.dof.focusDist = v; 
+          state.post.dof.isClickFocus = true;
+          reflect(range, input, v);
+          syncDOFToPass();
+      };
+      range.addEventListener("input", ()=>{
+          const v = num(range.value); if(!Number.isFinite(v)) return; commit(v);
+      });
+      input.addEventListener("change", ()=>{
+           const v = num(input.value); if(!Number.isFinite(v)) return; commit(v);
+      });
+  };
+
+  rowSSAO.querySelector("input").addEventListener("change", (e)=>{
+    state.post.enabled.ssao = !!e.target.checked;
+    applyEnableStates();
+    syncSSAOToPass();
+  });
+  rowDOF.querySelector("input").addEventListener("change", (e)=>{ 
+    state.post.enabled.dof = !!e.target.checked; 
+    applyEnableStates(); 
+    syncDOFToPass();
+  });
+  rowAutoFocus.querySelector("input").addEventListener("change", (e)=>{
+      state.post.dof.autoFocus = !!e.target.checked;
+      if(state.post.dof.autoFocus) state.post.dof.isClickFocus = false;
+      applyEnableStates();
+  });
+  rowSharp.querySelector("input").addEventListener("change", (e)=>{ 
+      state.post.enabled.sharpness = !!e.target.checked; 
+      applyEnableStates();
+      syncSharpnessToPass(); 
+  });
+  
+  uiTMType.select.addEventListener("change", ()=>{
+      state.post.toneMapping.type = Number(uiTMType.select.value);
+      syncToneToPass();
+  });
+  bindCustom(uiExposure, state.post.toneMapping, "exposure",   0.0, 10.0, syncToneToPass);
+  bindCustom(uiBright,   state.post.toneMapping, "brightness", -1.0, 1.0, syncToneToPass);
+  bindCustom(uiContrast, state.post.toneMapping, "contrast",   -1.0, 1.0, syncToneToPass);
+  bindCustom(uiSaturate, state.post.toneMapping, "saturation",  0.0, 2.0, syncToneToPass);
+
+  bind(uiIntensity.range, uiIntensity.input, state.post.ssao, "intensity", syncSSAOToPass);
+  bind(uiRadius.range,    uiRadius.input,    state.post.ssao, "radius",    syncSSAOToPass);
+  bind(uiBias.range,      uiBias.input,      state.post.ssao, "bias",      syncSSAOToPass);
+
+  bindFocusDist();
+  
+  bindCustom(uiFore, state.post.dof, "foreground", 0.0, 1.0, syncDOFToPass);
+  bindCustom(uiBack, state.post.dof, "background", 0.0, 1.0, syncDOFToPass);
+  
+  bindCustom(uiSharpness, state.post.sharpness, "strength", 0.0, 5.0, syncSharpnessToPass);
+
+  applyEnableStates();
+  syncSSAOToPass();
+  syncDOFToPass();
+  syncSharpnessToPass();
+  syncToneToPass();
+}
+</script>
+</body>
+</html>

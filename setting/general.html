@@ -1,0 +1,948 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, dom, state, model, renderer, scene, camera, controls, grid, setStatus, emit, libs } = viewer;
+
+  // -------------------------
+  // helpers
+  // -------------------------
+  const EXT = (name)=> ((name.split(".").pop()) || "").toLowerCase();
+
+  function summarizeFiles(files){
+    if (!files || files.length === 0) return "(no files)";
+    return files.map(f => `- ${f.name}  (${Math.round(f.size/1024)} KB)`).join("\n");
+  }
+
+  function choosePrimaryFile(files){
+    const byExt = (e)=> files.find(f => EXT(f.name) === e);
+    return byExt("glb") || byExt("gltf") || byExt("obj") || byExt("stl") || byExt("ply") || byExt("fbx") || files[0];
+  }
+
+  function buildFileMap(files){
+    const map = new Map();
+    for (const f of files){
+      map.set(f.name, f);
+      const base = f.name.split("/").pop().split("\\").pop();
+      if (!map.has(base)) map.set(base, f);
+    }
+    return map;
+  }
+
+  function createBlobURLMap(fileMap){
+    const urlMap = new Map();
+    for (const [k, f] of fileMap.entries()){
+      if (!urlMap.has(k)) urlMap.set(k, URL.createObjectURL(f));
+    }
+    return urlMap;
+  }
+
+  function revokeBlobURLs(urlMap){
+    for (const url of urlMap.values()){
+      try { URL.revokeObjectURL(url); } catch {}
+    }
+  }
+
+  function createManager(fileMap, urlMap){
+    const manager = new THREE.LoadingManager();
+    function candidates(url){
+      let u = url;
+      try { u = decodeURI(u); } catch {}
+      u = u.split("?")[0].split("#")[0];
+      u = u.replace(/^(\.\/)/, "");
+      u = u.replace(/\\/g, "/");
+      const base = u.split("/").pop();
+      return [u, base];
+    }
+    manager.setURLModifier((url)=>{
+      for (const c of candidates(url)){
+        if (urlMap.has(c)) return urlMap.get(c);
+      }
+      return url;
+    });
+    return manager;
+  }
+
+  function disposeRoot(root){
+    root.traverse(o=>{
+      if (o.geometry) o.geometry.dispose?.();
+      if (o.material){
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const m of mats){
+          if (!m) continue;
+          for (const k in m){ const v = m[k]; if (v && v.isTexture) v.dispose?.(); }
+          m.dispose?.();
+        }
+      }
+    });
+  }
+
+  // -------------------------
+  // UI enable/disable
+  // -------------------------
+  function setRotationUIEnabled(on){
+    dom.btnReset.disabled = !on;
+    dom.btnClear.disabled = !on;
+    dom.btnRotXm.disabled = !on; dom.btnRotXp.disabled = !on;
+    dom.btnRotYm.disabled = !on; dom.btnRotYp.disabled = !on;
+    dom.btnRotZm.disabled = !on; dom.btnRotZp.disabled = !on;
+    dom.btnRotReset.disabled = !on;
+    if (typeof updateCorrectRotButton === "function") updateCorrectRotButton();
+    rotViz.visible = on && state.showAdvRotation;
+    grid.visible = on && state.showAdvRotation;
+    viewer.modules.rendering?.setMatcapUIState?.();
+  }
+
+  // -------------------------
+  // Pivot wrap + framing
+  // -------------------------
+  function wrapWithPivot(modelRoot){
+    const pivot = new THREE.Group();
+    pivot.position.set(0, 0, 0);
+    pivot.add(modelRoot);
+    const box = new THREE.Box3().setFromObject(pivot);
+    const centerW = box.getCenter(new THREE.Vector3());
+    modelRoot.position.sub(centerW);
+    return { pivot, centerW };
+  }
+
+  function updateRotationVizFromPivot(){
+    if (!model.currentPivot){ rotViz.visible = false; return; }
+    const box = new THREE.Box3().setFromObject(model.currentPivot);
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const newRadius = maxDim * 0.20;
+    if (Math.abs(newRadius - rotRingRadius) / rotRingRadius > 0.15){
+      rotRingRadius = newRadius;
+      buildRotationRings(rotRingRadius);
+    }
+    grid.getWorldPosition(rotViz.position);
+    rotViz.visible = state.showAdvRotation;
+    setRingVisual(null, null);
+  }
+
+  function frameObject(){
+    if (!model.currentPivot) return;
+    const box = new THREE.Box3().setFromObject(model.currentPivot);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1.0;
+    const dist = maxDim * 1.8;
+    camera.near = Math.max(0.001, maxDim / 1000);
+    camera.far  = Math.max(10, maxDim * 1000);
+    camera.updateProjectionMatrix();
+    camera.position.set(center.x + dist, center.y + dist * 0.6, center.z + dist);
+    controls.target.copy(center);
+    controls.update();
+    updateRotationVizFromPivot();
+  }
+
+  function clearModel(){
+    if (!model.currentPivot) return;
+    scene.remove(model.currentPivot);
+    viewer.modules.rendering?.disposeOverrides?.();
+    if (model.currentModel) disposeRoot(model.currentModel);
+    model.currentPivot = null;
+    model.currentModel = null;
+    model.correctQuat = null;
+    rotViz.visible = false;
+    grid.visible = false;
+    setRotationUIEnabled(false);
+    setStatus("cleared");
+    emit("model-cleared", {});
+  }
+
+  function setCurrentModel(root){
+    clearModel();
+    const { pivot } = wrapWithPivot(root);
+    model.currentPivot = pivot;
+    model.currentModel = root;
+    scene.add(model.currentPivot);
+    model.basePivotQuat.copy(model.currentPivot.quaternion);
+    emit("model-loaded", { root });
+    frameObject();
+    setRotationUIEnabled(true);
+    setStatus("loaded (centered to origin)");
+  }
+
+  // -------------------------
+  // Rotation buttons
+  // -------------------------
+  function axisVector(axisChar){
+    return (axisChar === "x") ? new THREE.Vector3(1,0,0) : (axisChar === "y") ? new THREE.Vector3(0,1,0) : new THREE.Vector3(0,0,1);
+  }
+  function rotatePivotAxis(axis, dir){
+    if (!model.currentPivot) return;
+    const angle = dir * (Math.PI / 2);
+    const q = new THREE.Quaternion().setFromAxisAngle(axisVector(axis), angle);
+    model.currentPivot.quaternion.premultiply(q);
+    updateRotationVizFromPivot();
+  }
+  function resetRotation(){
+    if (!model.currentPivot) return;
+    model.currentPivot.quaternion.copy(model.basePivotQuat);
+    updateRotationVizFromPivot();
+  }
+
+  // -------------------------
+  // Rotation gizmo
+  // -------------------------
+  const rotViz = new THREE.Group();
+  rotViz.visible = false;
+  scene.add(rotViz);
+  const ringMats = {
+    x: new THREE.MeshBasicMaterial({ color: 0xff4a4a, transparent:true, opacity:0.75, depthTest:false }),
+    y: new THREE.MeshBasicMaterial({ color: 0x4aff4a, transparent:true, opacity:0.75, depthTest:false }),
+    z: new THREE.MeshBasicMaterial({ color: 0x4a8cff, transparent:true, opacity:0.75, depthTest:false }),
+    hover: 1.0, normal: 0.75, active: 1.0
+  };
+  const rings = { x:null, y:null, z:null };
+  let rotRingRadius = 1.0;
+  let zMoveGizmo = null;
+  let zMoveParts = [];
+
+  function setRingVisual(hoverAxis, activeAxis){
+    for (const k of ["x","y","z"]){
+      const m = ringMats[k];
+      let op = ringMats.normal;
+      if (k === activeAxis) op = ringMats.active;
+      else if (k === hoverAxis) op = ringMats.hover;
+      m.opacity = op; m.needsUpdate = true;
+    }
+  }
+
+  function buildRotationRings(radius){
+    for (const k of ["x","y","z"]){
+      if (rings[k]){ rings[k].geometry?.dispose?.(); rotViz.remove(rings[k]); rings[k] = null; }
+    }
+    const seg = 160;
+    const tube = Math.max(0.002, radius * 0.004);
+    const geomX = new THREE.TorusGeometry(radius, tube, 14, seg);
+    const geomY = new THREE.TorusGeometry(radius, tube, 14, seg);
+    const geomZ = new THREE.TorusGeometry(radius, tube, 14, seg);
+    rings.x = new THREE.Mesh(geomX, ringMats.x); rings.x.userData.axis = "x"; rings.x.rotation.y = Math.PI / 2;
+    rings.y = new THREE.Mesh(geomY, ringMats.y); rings.y.userData.axis = "y"; rings.y.rotation.x = Math.PI / 2;
+    rings.z = new THREE.Mesh(geomZ, ringMats.z); rings.z.userData.axis = "z";
+    rotViz.add(rings.x, rings.y, rings.z);
+
+    if (zMoveGizmo){
+      rotViz.remove(zMoveGizmo);
+      zMoveParts.forEach(p=>{ if (p.geometry) p.geometry.dispose?.(); if (p.material) p.material.dispose?.(); });
+      zMoveGizmo = null; zMoveParts = [];
+    }
+    zMoveGizmo = new THREE.Group();
+    const shaftLen = radius * 0.85;
+    const headLen  = radius * 0.22;
+    const shaftR   = Math.max(0.002, radius * 0.02);
+    const headR    = shaftR * 2.2;
+    const shaftGeo = new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 18);
+    const shaftMat = new THREE.MeshBasicMaterial({ color: 0x4a8cff, transparent:true, opacity:0.9, depthTest:false });
+    const shaft = new THREE.Mesh(shaftGeo, shaftMat);
+    shaft.position.y = shaftLen * 0.5; shaft.userData.kind = "zmove";
+    zMoveGizmo.add(shaft);
+    const headGeo = new THREE.ConeGeometry(headR, headLen, 20);
+    const headMat = new THREE.MeshBasicMaterial({ color: 0x4a8cff, transparent:true, opacity:0.9, depthTest:false });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = shaftLen + headLen * 0.5; head.userData.kind = "zmove";
+    zMoveGizmo.add(head);
+    zMoveGizmo.rotation.x = Math.PI / 2;
+    zMoveParts = [shaft, head];
+    rotViz.add(zMoveGizmo);
+  }
+  buildRotationRings(rotRingRadius);
+
+  // pointer drag
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const drag = { active: false, axis: null, lastX: 0, lastY: 0, perp2D: new THREE.Vector2(0,1) };
+  const dragZ = { active: false, lastY: 0 };
+  function getCanvasRect(){ return renderer.domElement.getBoundingClientRect(); }
+  function eventToNDC(ev){
+    const r = getCanvasRect();
+    const x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+    const y = -(((ev.clientY - r.top) / r.height) * 2 - 1);
+    ndc.set(x, y);
+  }
+  function projectAxisToScreenPerp(axisChar){
+    const center = new THREE.Vector3();
+    model.currentPivot.getWorldPosition(center);
+    const axis = axisVector(axisChar);
+    const cN = center.clone().project(camera);
+    const aN = center.clone().add(axis).project(camera);
+    const v = new THREE.Vector2(aN.x - cN.x, aN.y - cN.y);
+    if (v.lengthSq() < 1e-8) v.set(0,1);
+    v.normalize();
+    return new THREE.Vector2(-v.y, v.x).normalize();
+  }
+  const ROT_SENS = 0.01;
+  const ZMOVE_SENS = 0.004;
+  function onPointerMove(ev){
+    if (!model.currentPivot) return;
+    if (!drag.active && !dragZ.active && state.showAdvRotation){
+      eventToNDC(ev);
+      raycaster.setFromCamera(ndc, camera);
+      const targets = [rings.x, rings.y, rings.z].filter(Boolean);
+      if (zMoveGizmo) targets.push(zMoveGizmo);
+      const hits = raycaster.intersectObjects(targets, true);
+      const obj = hits[0]?.object;
+      const hoverAxis = obj?.userData?.axis ?? null;
+      setRingVisual(hoverAxis, null);
+      const hoverZ = (obj?.userData?.kind === "zmove");
+      if (zMoveParts.length){ for (const p of zMoveParts){ if (!p.material) continue; p.material.opacity = hoverZ ? 1.0 : 0.9; p.material.needsUpdate = true; } }
+    }
+    if (dragZ.active){
+      const dy = ev.clientY - dragZ.lastY;
+      dragZ.lastY = ev.clientY;
+      grid.position.z += (-dy) * (ZMOVE_SENS * Math.max(0.5, rotRingRadius));
+      grid.getWorldPosition(rotViz.position);
+      return;
+    }
+    if (!drag.active) return;
+    const dx = ev.clientX - drag.lastX;
+    const dy = ev.clientY - drag.lastY;
+    drag.lastX = ev.clientX;
+    drag.lastY = ev.clientY;
+    const delta = dx * drag.perp2D.x + dy * drag.perp2D.y;
+    const angle = delta * ROT_SENS;
+    const q = new THREE.Quaternion().setFromAxisAngle(axisVector(drag.axis), angle);
+    model.currentPivot.quaternion.premultiply(q);
+    setRingVisual(null, drag.axis);
+  }
+  function onPointerDown(ev){
+    if (!model.currentPivot) return;
+    if (!state.showAdvRotation) return;
+    eventToNDC(ev);
+    raycaster.setFromCamera(ndc, camera);
+    const targets = [rings.x, rings.y, rings.z].filter(Boolean);
+    if (zMoveGizmo) targets.push(zMoveGizmo);
+    const hits = raycaster.intersectObjects(targets, true);
+    if (!hits.length) return;
+    if (hits[0].object?.userData?.kind === "zmove"){
+      dragZ.active = true; dragZ.lastY = ev.clientY; controls.enabled = false;
+      renderer.domElement.setPointerCapture?.(ev.pointerId);
+      return;
+    }
+    const axis = hits[0].object.userData.axis;
+    if (!axis) return;
+    drag.active = true; drag.axis = axis; drag.lastX = ev.clientX; drag.lastY = ev.clientY;
+    drag.perp2D = projectAxisToScreenPerp(axis);
+    controls.enabled = false;
+    setRingVisual(null, axis);
+    renderer.domElement.setPointerCapture?.(ev.pointerId);
+  }
+  function onPointerUp(ev){
+    if (dragZ.active){ dragZ.active = false; controls.enabled = true; renderer.domElement.releasePointerCapture?.(ev.pointerId); return; }
+    if (!drag.active) return;
+    drag.active = false; drag.axis = null; controls.enabled = true; setRingVisual(null, null);
+    renderer.domElement.releasePointerCapture?.(ev.pointerId);
+  }
+  renderer.domElement.addEventListener("pointermove", onPointerMove);
+  renderer.domElement.addEventListener("pointerdown", onPointerDown);
+  window.addEventListener("pointerup", onPointerUp);
+
+  // -------------------------
+  // loaders
+  // -------------------------
+  function stampLoadedInfo(ext, name){
+    state.loadedExt = (ext || "").toLowerCase();
+    state.loadedName = name || "";
+  }
+  function stampRootExt(root, ext){
+    if (!root) return;
+    root.userData = root.userData || {};
+    root.userData.sourceExt = (ext || "").toLowerCase();
+    root.userData.fileExt = (ext || "").toLowerCase();
+    root.userData.name = root.userData.name || root.name || "";
+  }
+
+  // ★ Auto Assign Logic
+  async function tryAutoAssignTextures(root, allFiles, usedFiles){
+    if (!root || !allFiles || !allFiles.length) return;
+
+    const usedSet = new Set(usedFiles || []);
+    const unusedImages = allFiles.filter(f => {
+      if (!f || usedSet.has(f)) return false;
+      const ln = (f.name || "").toLowerCase();
+      return ln.endsWith(".png") || ln.endsWith(".jpg") || ln.endsWith(".jpeg") || ln.endsWith(".webp") || ln.endsWith(".bmp");
+    });
+    if (unusedImages.length === 0) return;
+
+    // Helper: collect unique materials
+    const mats = [];
+    const seen = new Set();
+    root.traverse(o=>{
+      if (!o.isMesh || !o.material) return;
+      const arr = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of arr){
+        if (!m || seen.has(m.uuid)) continue;
+        seen.add(m.uuid);
+        mats.push(m);
+      }
+    });
+    if (mats.length === 0) return;
+
+    const texLoader = new THREE.TextureLoader();
+
+    const loadTex = async (f, isSRGB)=>{
+      const url = URL.createObjectURL(f);
+      try{
+        const t = await texLoader.loadAsync(url);
+        t.name = f.name;
+        t.wrapS = THREE.RepeatWrapping;
+        t.wrapT = THREE.RepeatWrapping;
+        // Note: colorSpace is supported in recent three.js; if not, it will be ignored.
+        if (isSRGB){
+          t.colorSpace = THREE.SRGBColorSpace;
+        } else {
+          t.colorSpace = (THREE.NoColorSpace != null) ? THREE.NoColorSpace : THREE.LinearSRGBColorSpace;
+        }
+        t.needsUpdate = true;
+        return t;
+      }catch(e){
+        console.warn("Auto-load failed", f?.name);
+        return null;
+      }finally{
+        try{ URL.revokeObjectURL(url); }catch(_){}
+      }
+    };
+
+    // ---- Matching helpers (Rule 1 -> Rule 2 fallback) ----
+    const normKey = (v)=>{
+      return String(v||"")
+        .toLowerCase()
+        .replace(/\.[a-z0-9]+$/i, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+    };
+    const scoreMatch = (fileKey, hintKey)=>{
+      if (!fileKey || !hintKey) return 0;
+      if (fileKey === hintKey) return 100;
+      if (fileKey.includes(hintKey)) return 80;
+      if (hintKey.includes(fileKey)) return 60;
+      const ft = new Set(fileKey.split(/\s+/).filter(Boolean));
+      const ht = new Set(hintKey.split(/\s+/).filter(Boolean));
+      let inter = 0;
+      for (const t of ft){ if (ht.has(t)) inter++; }
+      return inter * 10;
+    };
+    const extractHints = (mat, kind)=>{
+      // kind: "color"|"metal"|"rough"|"normal"|"ao"
+      const out = [];
+      const push = (v)=>{ const k = normKey(v); if (k) out.push(k); };
+
+      // Prefer embedded / referenced names when available (Rule 1)
+      // Many exporters store these under userData, but it's not guaranteed.
+      const ud = mat?.userData || {};
+      if (kind === "color"){
+        push(mat?.map?.image?.name); push(mat?.map?.name); push(mat?.map?.image?.src);
+        push(ud.map); push(ud.diffuseMap); push(ud.albedoMap); push(ud.baseColorMap); push(ud.texture); push(ud.file); push(ud.src);
+      } else if (kind === "metal"){
+        push(mat?.metalnessMap?.image?.name); push(mat?.metalnessMap?.name); push(ud.metalnessMap); push(ud.metalMap);
+      } else if (kind === "rough"){
+        push(mat?.roughnessMap?.image?.name); push(mat?.roughnessMap?.name); push(ud.roughnessMap); push(ud.roughMap);
+      } else if (kind === "normal"){
+        push(mat?.normalMap?.image?.name); push(mat?.normalMap?.name); push(ud.normalMap); push(ud.normMap);
+      } else if (kind === "ao"){
+        push(mat?.aoMap?.image?.name); push(mat?.aoMap?.name); push(ud.aoMap); push(ud.occlusionMap);
+      }
+
+      // Always include material name as a weak hint (Rule 2 helper)
+      push(mat?.name);
+
+      return [...new Set(out)].filter(Boolean);
+    };
+
+    const mapByHintThenZip = (kindFiles, kind)=>{
+      const fileKeys = kindFiles.map(f=>({ f, key:normKey(f.name) })).filter(x=>x.key);
+      const used = new Set();
+      const map = new Map(); // mat.uuid -> file
+
+      // Rule 1: hint match
+      for (const mat of mats){
+        const hints = extractHints(mat, kind);
+        let best = null;
+        for (const fk of fileKeys){
+          if (used.has(fk.f)) continue;
+          let score = 0;
+          for (const hk of hints) score = Math.max(score, scoreMatch(fk.key, hk));
+          if (!best || score > best.score) best = { file: fk.f, score };
+        }
+        if (best && best.score >= 50){
+          map.set(mat.uuid, best.file);
+          used.add(best.file);
+        }
+      }
+
+      // Rule 2: zip in descending order for remaining mats/files
+      const matsLeft = mats.filter(m=>!map.has(m.uuid)).slice().sort((a,b)=>{
+        const an = (a?.name||"").toLowerCase();
+        const bn = (b?.name||"").toLowerCase();
+        if (an < bn) return 1;
+        if (an > bn) return -1;
+        return 0;
+      });
+      const filesLeft = kindFiles.filter(f=>!used.has(f)).slice().sort((a,b)=>{
+        const an = (a?.name||"").toLowerCase();
+        const bn = (b?.name||"").toLowerCase();
+        if (an < bn) return 1;
+        if (an > bn) return -1;
+        return 0;
+      });
+      const n = Math.min(matsLeft.length, filesLeft.length);
+      for (let i=0;i<n;i++){
+        map.set(matsLeft[i].uuid, filesLeft[i]);
+      }
+
+      return map;
+    };
+
+    // ---- classify files by kind (simple filename heuristics) ----
+    const patMetal = /(metal|metallic)/i;
+    const patRough = /(rough|roughness)/i;
+    const patNorm  = /(norm|normal)/i;
+    const patAO    = /(ao|occlusion|ambient)/i;
+    const patCol   = /(color|base|albedo|diffuse)/i;
+
+    const filesMetal = unusedImages.filter(f=>patMetal.test(f.name));
+    const filesRough = unusedImages.filter(f=>patRough.test(f.name));
+    const filesNorm  = unusedImages.filter(f=>patNorm.test(f.name));
+    const filesAO    = unusedImages.filter(f=>patAO.test(f.name));
+    const filesCol   = unusedImages.filter(f=>patCol.test(f.name));
+
+    // Apply per kind (per-material mapping when multiple files exist)
+    const applyKind = async (kindFiles, kind, setter, isSRGB)=>{
+      if (!kindFiles.length) return;
+
+      // If there's only one file, it's safe to apply to all materials.
+      if (kindFiles.length === 1){
+        const tex = await loadTex(kindFiles[0], isSRGB);
+        if (!tex) return;
+        for (const m of mats){ setter(m, tex); m.needsUpdate = true; }
+        return;
+      }
+
+      // Multiple files: map per material (Rule 1 -> Rule 2 fallback)
+      const mapping = mapByHintThenZip(kindFiles, kind);
+
+      // Load each file once (dedupe)
+      const texCache = new Map(); // File -> Texture
+      for (const m of mats){
+        const f = mapping.get(m.uuid);
+        if (!f) continue;
+        if (!texCache.has(f)){
+          const t = await loadTex(f, isSRGB);
+          if (t) texCache.set(f, t);
+        }
+        const tex = texCache.get(f);
+        if (!tex) continue;
+        setter(m, tex);
+        // baseColor: reset tint to white so the texture shows as-is
+        if (kind === "color" && m.color) m.color.set(0xffffff);
+        m.needsUpdate = true;
+      }
+    };
+
+    await applyKind(filesMetal, "metal", (m,tex)=>{ m.metalnessMap = tex; }, false);
+    await applyKind(filesRough, "rough", (m,tex)=>{ m.roughnessMap = tex; }, false);
+    await applyKind(filesNorm,  "normal",(m,tex)=>{ m.normalMap    = tex; }, false);
+    await applyKind(filesAO,    "ao",    (m,tex)=>{ m.aoMap        = tex; }, false);
+    await applyKind(filesCol,   "color", (m,tex)=>{ m.map          = tex; }, true);
+  }
+
+  async function loadGLTF(file, files, ext){
+    setStatus("loading glTF...");
+    const fileMap = buildFileMap(files);
+    const urlMap = createBlobURLMap(fileMap);
+    const manager = createManager(fileMap, urlMap);
+    const url = urlMap.get(file.name) || URL.createObjectURL(file);
+    try{
+      const loader = new libs.GLTFLoader(manager);
+      const gltf = await loader.loadAsync(url);
+      const root = gltf.scene || gltf.scenes?.[0];
+      if (!root) throw new Error("No scene in glTF");
+      stampLoadedInfo(ext, file.name);
+      stampRootExt(root, ext);
+      
+      // Auto assign if any extra images
+      await tryAutoAssignTextures(root, files, [file]);
+
+      setCurrentModel(root);
+      setStatus("loaded (glTF)");
+    } finally {
+      // revokeBlobURLs(urlMap); // サムネイルのために維持
+    }
+  }
+
+  async function loadOBJSet(objFile, files){
+    setStatus("loading OBJ...");
+    const fileMap = buildFileMap(files);
+    const urlMap = createBlobURLMap(fileMap);
+    const manager = createManager(fileMap, urlMap);
+    const mtlFile = files.find(f => EXT(f.name) === "mtl");
+    const usedFiles = [objFile]; if(mtlFile) usedFiles.push(mtlFile);
+
+    try{
+      let materials = null;
+      if (mtlFile){
+        const mtlUrl = urlMap.get(mtlFile.name) || URL.createObjectURL(mtlFile);
+        const mtlLoader = new libs.MTLLoader(manager);
+        mtlLoader.setResourcePath("./");
+        materials = await mtlLoader.loadAsync(mtlUrl);
+        materials.preload();
+      }
+      const objUrl = urlMap.get(objFile.name) || URL.createObjectURL(objFile);
+      const objLoader = new libs.OBJLoader(manager);
+      if (materials) objLoader.setMaterials(materials);
+      const root = await objLoader.loadAsync(objUrl);
+      stampLoadedInfo("obj", objFile.name);
+      stampRootExt(root, "obj");
+
+      // Auto assign
+      await tryAutoAssignTextures(root, files, usedFiles);
+
+      setCurrentModel(root);
+      setStatus(mtlFile ? "loaded (OBJ+MTL)" : "loaded (OBJ)");
+    } finally {
+      // revokeBlobURLs(urlMap); // サムネイルのために維持
+    }
+  }
+
+  async function loadFBX(file, files){
+    setStatus("loading FBX...");
+    const fileMap = buildFileMap(files);
+    const urlMap = createBlobURLMap(fileMap);
+    const manager = createManager(fileMap, urlMap);
+    const url = urlMap.get(file.name) || URL.createObjectURL(file);
+    try{
+      const loader = new libs.FBXLoader(manager);
+      const root = await loader.loadAsync(url);
+      stampLoadedInfo("fbx", file.name);
+      stampRootExt(root, "fbx");
+
+      await tryAutoAssignTextures(root, files, [file]);
+
+      setCurrentModel(root);
+      setStatus("loaded (FBX)");
+    } finally {
+      // revokeBlobURLs(urlMap); // サムネイルのために維持
+    }
+  }
+
+  async function loadSTL(file){
+    setStatus("loading STL...");
+    const url = URL.createObjectURL(file);
+    try{
+      const loader = new libs.STLLoader();
+      const geo = await loader.loadAsync(url);
+      geo.computeVertexNormals?.();
+      const mat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 1.0, metalness: 0.0 });
+      const mesh = new THREE.Mesh(geo, mat);
+      const root = new THREE.Group();
+      root.add(mesh);
+      stampLoadedInfo("stl", file.name);
+      stampRootExt(root, "stl");
+      setCurrentModel(root);
+      setStatus("loaded (STL)");
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  async function loadPLY(file){
+    setStatus("loading PLY...");
+    const url = URL.createObjectURL(file);
+    try{
+      const loader = new libs.PLYLoader();
+      const geo = await loader.loadAsync(url);
+      geo.computeVertexNormals?.();
+      const hasColors = !!geo.getAttribute("color");
+      const mat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 1.0, metalness: 0.0, vertexColors: hasColors });
+      const mesh = new THREE.Mesh(geo, mat);
+      const root = new THREE.Group();
+      root.add(mesh);
+      stampLoadedInfo("ply", file.name);
+      stampRootExt(root, "ply");
+      setCurrentModel(root);
+      setStatus("loaded (PLY)");
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  async function loadModelFromFiles(files){
+    if (!files || files.length === 0) return;
+    dom.fileListEl.textContent = summarizeFiles(files);
+    const primary = choosePrimaryFile(files);
+    const ext = EXT(primary.name);
+    try{
+      if (ext === "glb" || ext === "gltf"){ await loadGLTF(primary, files, ext); return; }
+      if (ext === "obj"){ await loadOBJSet(primary, files); return; }
+      if (ext === "stl"){ await loadSTL(primary); return; }
+      if (ext === "ply"){ await loadPLY(primary); return; }
+      if (ext === "fbx"){ await loadFBX(primary, files); return; }
+      throw new Error(`Unsupported primary file: ${primary.name}`);
+    } catch(e){
+      console.error(e);
+      setStatus("load failed");
+      alert("読み込み失敗: " + (e?.message || e));
+    }
+  }
+
+  dom.btnPick.addEventListener("click", ()=> dom.fileInput.click());
+  dom.fileInput.addEventListener("change", (e)=>{
+    const files = [...(e.target.files || [])];
+    e.target.value = "";
+    if (files.length) loadModelFromFiles(files);
+  });
+  dom.btnReset.addEventListener("click", ()=> frameObject());
+  dom.btnClear.addEventListener("click", ()=>{
+    clearModel();
+    dom.fileListEl.textContent = "(no files)";
+  });
+  window.addEventListener("dragover", (e)=>{ e.preventDefault(); dom.dropHint.style.display = "grid"; }, {passive:false});
+  window.addEventListener("dragleave", (e)=>{ if (e.relatedTarget === null) dom.dropHint.style.display = "none"; });
+  window.addEventListener("drop", (e)=>{
+    e.preventDefault(); dom.dropHint.style.display = "none";
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.length) loadModelFromFiles(files);
+  }, {passive:false});
+  dom.chkAdvRot.addEventListener("change", ()=>{
+    state.showAdvRotation = !!dom.chkAdvRot.checked;
+    if (model.currentPivot) updateRotationVizFromPivot(); else rotViz.visible = false;
+    grid.visible = !!dom.chkAdvRot.checked && !!model.currentPivot;
+    emit("state-changed", { key: "showAdvRotation", value: state.showAdvRotation });
+  });
+  dom.btnRotXm.addEventListener("click", ()=> rotatePivotAxis("x", -1));
+  dom.btnRotXp.addEventListener("click", ()=> rotatePivotAxis("x", +1));
+  dom.btnRotYm.addEventListener("click", ()=> rotatePivotAxis("y", -1));
+  dom.btnRotYp.addEventListener("click", ()=> rotatePivotAxis("y", +1));
+  dom.btnRotZm.addEventListener("click", ()=> rotatePivotAxis("z", -1));
+  dom.btnRotZp.addEventListener("click", ()=> rotatePivotAxis("z", +1));
+  dom.btnRotReset.addEventListener("click", resetRotation);
+
+  // 「回転をセット」ボタン（動的追加）
+  const btnSetCorrectRot = document.createElement("button");
+  btnSetCorrectRot.textContent = "回転をセット";
+  btnSetCorrectRot.disabled = true;
+  btnSetCorrectRot.title = "現在の回転を正位置として保存（Aruco用）";
+  // 回転リセットボタンの後に挿入
+  dom.btnRotReset.parentElement?.appendChild(btnSetCorrectRot);
+
+  btnSetCorrectRot.addEventListener("click", ()=>{
+    if (!model.currentPivot) return;
+    model.correctQuat = model.currentPivot.quaternion.clone();
+    setStatus("correct rotation set");
+    console.log("[general] correctQuat set:", model.correctQuat.toArray().map(v=>v.toFixed(3)));
+  });
+
+  // モデル読み込み時にボタンを有効化、クリア時に無効化
+  function updateCorrectRotButton(){
+    btnSetCorrectRot.disabled = !model.currentPivot;
+  }
+
+
+  // -------------------------
+  // TEST: Non-contact rotate (Mouse prototype / external hand support)
+  // -------------------------
+  const testRotate = {
+    mode: "off", // "off" | "mouse"
+    enabled: false,
+    sensitivityX: 4.0, // yaw-ish
+    sensitivityY: 3.0, // pitch-ish
+    deadZone: 0.002,
+    prev: null,        // {x,y}
+  };
+
+  function getRotTargetPivot(){
+    return model.currentPivot || null;
+  }
+
+  function applyTestRotation(dx, dy){
+    const target = getRotTargetPivot();
+    if (!target) return;
+
+    if (Math.abs(dx) < testRotate.deadZone && Math.abs(dy) < testRotate.deadZone) return;
+
+    // 要望仕様:
+    // 左右移動(dx) -> 常にZ軸回転（右:+ / 左:-）
+    // 上下移動(dy) -> 「その時点の視点ベクトル」に直交する軸（画面の左右方向ベクトル）を軸に回転
+    //   例: 視点が ±Y 方向なら軸は ±X 方向
+    //       視点が ±X 方向なら軸は ±Y 方向
+    // 画面座標では上移動は dy<0 なので、上を +回転にするため角度は -dy を使う
+
+    // 1) 左右はワールドZ軸
+    const qZ = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0,0,1),
+      dx * testRotate.sensitivityX
+    );
+    target.quaternion.premultiply(qZ);
+
+    // 2) 上下は「視点ベクトルに直交する軸」
+    //    視点方向 = カメラ -> controls.target（なければモデル中心）
+    const camPos = new THREE.Vector3();
+    camera.getWorldPosition(camPos);
+
+    const tgtPos = new THREE.Vector3();
+    if (controls && controls.target) {
+      tgtPos.copy(controls.target);
+    } else {
+      target.getWorldPosition(tgtPos);
+    }
+
+    const viewDir = tgtPos.clone().sub(camPos); // camera forward
+    if (viewDir.lengthSq() > 1e-12) {
+      viewDir.normalize();
+
+      // ワールドZを固定アップとして使う（左右回転がZ基準のため整合性が良い）
+      const worldUp = new THREE.Vector3(0,0,1);
+
+      // 画面の左右方向ベクトル = worldUp × viewDir
+      // （viewDir と worldUp が平行に近い場合はフォールバック）
+      let screenRight = new THREE.Vector3().crossVectors(worldUp, viewDir);
+      if (screenRight.lengthSq() < 1e-10) {
+        // 視線がZ軸に近い時のフォールバック（X軸を基準に）
+        screenRight = new THREE.Vector3().crossVectors(new THREE.Vector3(1,0,0), viewDir);
+      }
+
+      if (screenRight.lengthSq() > 1e-12) {
+        screenRight.normalize();
+
+        const qPitch = new THREE.Quaternion().setFromAxisAngle(
+          screenRight,
+          (-dy) * testRotate.sensitivityY
+        );
+        target.quaternion.premultiply(qPitch);
+      }
+    }
+
+    updateRotationVizFromPivot();
+  }
+
+  function resetTestPointer(){
+    testRotate.prev = null;
+  }
+
+  // ----- Mouse mode (pointer -> rotate) -----
+  function onTestPointerMove(ev){
+    // 既存機能を壊さない
+    if (!testRotate.enabled) return;
+    if (testRotate.mode !== "mouse") return;
+    if (!model.currentPivot) return;
+
+    // 既存のギズモドラッグ中は無効
+    if (drag.active || dragZ.active) return;
+
+    // OrbitControlsの通常ドラッグ中も競合しやすいので、ボタン押下中は無効（お試し）
+    if (ev.buttons && ev.buttons !== 0) return;
+
+    const r = renderer.domElement.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+
+    const x = (ev.clientX - r.left) / r.width;
+    const y = (ev.clientY - r.top) / r.height;
+
+    if (x < 0 || x > 1 || y < 0 || y > 1){
+      testRotate.prev = null;
+      return;
+    }
+
+    if (testRotate.prev){
+      const dx = x - testRotate.prev.x;
+      const dy = y - testRotate.prev.y;
+      applyTestRotation(dx, dy);
+    }
+    testRotate.prev = { x, y };
+  }
+
+  renderer.domElement.addEventListener("pointermove", onTestPointerMove);
+
+  async function setNonContactRotateEnabled(enabled, mode = testRotate.mode){
+    const want = !!enabled;
+    const nextMode = (mode === "mouse") ? "mouse" : "off";
+
+    testRotate.enabled = want && nextMode === "mouse";
+    testRotate.mode = testRotate.enabled ? "mouse" : "off";
+    resetTestPointer();
+
+    return { enabled: testRotate.enabled, mode: testRotate.mode };
+  }
+
+  function setNonContactRotateSensitivity(x, y){
+    const nx = Number(x);
+    const ny = Number(y);
+    if (Number.isFinite(nx)) testRotate.sensitivityX = nx;
+    if (Number.isFinite(ny)) testRotate.sensitivityY = ny;
+    return { sensitivityX: testRotate.sensitivityX, sensitivityY: testRotate.sensitivityY };
+  }
+
+  function getNonContactRotateState(){
+    return {
+      enabled: !!testRotate.enabled,
+      mode: testRotate.mode,
+      sensitivityX: testRotate.sensitivityX,
+      sensitivityY: testRotate.sensitivityY,
+    };
+  }
+
+  function applyNonContactRotateDelta(dx, dy){
+    const ndx = Number(dx);
+    const ndy = Number(dy);
+    if (!Number.isFinite(ndx) || !Number.isFinite(ndy)) return false;
+    if (!model.currentPivot) return false;
+    applyTestRotation(ndx, ndy);
+    return true;
+  }
+
+  function applyExternalQuaternion(q){
+    if (!model.currentPivot || !q) return false;
+    const qq = q.clone().normalize();
+    model.currentPivot.quaternion.copy(model.basePivotQuat).multiply(qq);
+    updateRotationVizFromPivot();
+    return true;
+  }
+
+  /** ピボットの quaternion をワールド空間で直接設定（座標系変換済みの値を渡す） */
+  function setPivotQuaternionDirect(q){
+    if (!model.currentPivot || !q) return false;
+    model.currentPivot.quaternion.copy(q).normalize();
+    updateRotationVizFromPivot();
+    return true;
+  }
+
+  /** 現在のピボット quaternion を取得 */
+  function getPivotQuaternion(){
+    if (!model.currentPivot) return null;
+    return model.currentPivot.quaternion.clone();
+  }
+
+  /** 保存済みの正しい回転を取得 */
+  function getCorrectQuat(){
+    return model.correctQuat ? model.correctQuat.clone() : null;
+  }
+
+  /** 正しい回転をピボットに適用 */
+  function applyCorrectQuat(){
+    if (!model.currentPivot || !model.correctQuat) return false;
+    model.currentPivot.quaternion.copy(model.correctQuat);
+    updateRotationVizFromPivot();
+    return true;
+  }
+
+  viewer.modules.general = {
+    loadModelFromFiles, setCurrentModel, clearModel, frameObject, updateRotationVizFromPivot, buildRotationRings,
+    setNonContactRotateEnabled, setNonContactRotateSensitivity,
+    getNonContactRotateState, applyNonContactRotateDelta, resetNonContactRotatePointer: resetTestPointer,
+    applyExternalQuaternion,
+    setPivotQuaternionDirect,
+    getPivotQuaternion,
+    getCorrectQuat,
+    applyCorrectQuat,
+  };
+  setRotationUIEnabled(false);
+  setStatus("general ready");
+}
+</script>
+</body>
+</html>

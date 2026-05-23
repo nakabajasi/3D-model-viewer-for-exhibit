@@ -1,0 +1,1927 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8" /></head>
+<body>
+<script type="module" data-entry>
+export default async function init(viewer){
+  const { THREE, state, model, on, emit } = viewer;
+
+  // -----------------------------
+  // Utilities
+  // -----------------------------
+  const clamp = (v, a, b)=> Math.max(a, Math.min(b, v));
+
+  const ensureStateRoot = ()=>{
+    if (!state.material) state.material = {};
+    if (!state.material.byMat) state.material.byMat = {};     // JSON-friendly
+    if (!state.material.selectedUuid) state.material.selectedUuid = "";
+  };
+
+  // runtime cache (textures are NOT JSON)
+  const runtime = {
+    texLoader: new THREE.TextureLoader(),
+    // Map<materialUuid, { baseColorTex, metalnessTex, roughnessTex, specTex, normalTex, aoTex, emisTex }>
+    texByMat: new Map(),
+
+    // Map<materialUuid, { baseColorWasUserSet:boolean }>
+    touchedByMat: new Map(),
+
+    // Map<materialUuid, { slot: TexParams }>
+    // keep UV transform stable when replacing textures
+    expectByMat: new Map(),
+
+    // Map<materialUuid, { baseColor, metalness, roughness, specularF0, normal, ao, emission }>
+    // (kept for backward compat; remove is not used now)
+    origMapByMat: new Map(),
+
+    // UI: keep preview URL for imported files (avoid leaking URLs)
+    previewUrlByMat: new Map(),
+
+    // FBX handling flags
+    modelIsFBX: false,
+    fbxPrepared: false, // run once per model load
+  };
+
+  const getOrCreateMatState = (matUuid)=>{
+    ensureStateRoot();
+    const byMat = state.material.byMat;
+    if (!byMat[matUuid]){
+      byMat[matUuid] = {
+        baseColor:  { name: "", flipYOverride: null }, // name shown in UI (imported file or "(embedded)")
+
+        // sliders always active.
+        metalness:  { name: "", strength: 0.0 },  // initial 0
+        roughness:  { name: "", strength: 1.0 },  // initial 1
+        specularF0: { name: "", strength: 0.5 },  // initial 0.5
+
+        // ON/OFF removed: 0 disables effect
+        normal:     { name: "", strength: 0.0, flipGreen: false },
+        ao:         { name: "", strength: 0.0 },  // initial 0 (OFF via slider)
+        emission:   { name: "", strength: 0.0 },  // initial 0 (OFF via slider)
+        clearcoat:          { name: "", strength: 0.0 },
+        clearcoatRoughness: { name: "", strength: 0.0 },
+      };
+    } else {
+      // Backward compat: remove old enabled flags if present
+      if (byMat[matUuid].metalness && byMat[matUuid].metalness.enabled != null) delete byMat[matUuid].metalness.enabled;
+      if (byMat[matUuid].roughness && byMat[matUuid].roughness.enabled != null) delete byMat[matUuid].roughness.enabled;
+      if (byMat[matUuid].specularF0 && byMat[matUuid].specularF0.enabled != null) delete byMat[matUuid].specularF0.enabled;
+      if (byMat[matUuid].ao && byMat[matUuid].ao.enabled != null) delete byMat[matUuid].ao.enabled;
+      if (byMat[matUuid].normal && byMat[matUuid].normal.enabled != null) delete byMat[matUuid].normal.enabled;
+      if (byMat[matUuid].emission && byMat[matUuid].emission.enabled != null) delete byMat[matUuid].emission.enabled;
+
+      // Ensure defaults exist (in case of old state)
+      if (byMat[matUuid].metalness?.strength == null) byMat[matUuid].metalness.strength = 0.0;
+      if (byMat[matUuid].roughness?.strength == null) byMat[matUuid].roughness.strength = 1.0;
+      if (byMat[matUuid].specularF0?.strength == null) byMat[matUuid].specularF0.strength = 0.5;
+      if (byMat[matUuid].ao?.strength == null) byMat[matUuid].ao.strength = 0.0;
+      if (byMat[matUuid].normal?.strength == null) byMat[matUuid].normal.strength = 0.0;
+      if (byMat[matUuid].emission?.strength == null) byMat[matUuid].emission.strength = 0.0;
+      if (byMat[matUuid].normal?.flipGreen == null) byMat[matUuid].normal.flipGreen = false;
+      if (!byMat[matUuid].clearcoat) byMat[matUuid].clearcoat = { name: "", strength: 0.0 };
+      if (byMat[matUuid].clearcoat?.strength == null) byMat[matUuid].clearcoat.strength = 0.0;
+      if (!byMat[matUuid].clearcoatRoughness) byMat[matUuid].clearcoatRoughness = { name: "", strength: 0.0 };
+      if (byMat[matUuid].clearcoatRoughness?.strength == null) byMat[matUuid].clearcoatRoughness.strength = 0.0;
+    }
+    return byMat[matUuid];
+  };
+
+  const getOrCreateRuntimeTex = (matUuid)=>{
+    if (!runtime.texByMat.has(matUuid)){
+      runtime.texByMat.set(matUuid, {
+        baseColorTex: null,
+        metalnessTex: null,
+        roughnessTex: null,
+        specTex: null,
+        normalTex: null,
+        aoTex: null,
+        emisTex: null,
+        clearcoatTex: null,
+        clearcoatRoughnessTex: null,
+      });
+    }
+    return runtime.texByMat.get(matUuid);
+  };
+
+  const getOrCreateTouched = (matUuid)=>{
+    if (!runtime.touchedByMat.has(matUuid)){
+      runtime.touchedByMat.set(matUuid, { baseColorWasUserSet: false });
+    }
+    return runtime.touchedByMat.get(matUuid);
+  };
+
+  const getOrCreateOrigMaps = (matUuid)=>{
+    if (!runtime.origMapByMat.has(matUuid)){
+      runtime.origMapByMat.set(matUuid, {
+        baseColor: null,
+        metalness: null,
+        roughness: null,
+        specularF0: null,
+        normal: null,
+        ao: null,
+        emission: null,
+        clearcoat: null,
+        clearcoatRoughness: null,
+      });
+    }
+    return runtime.origMapByMat.get(matUuid);
+  };
+
+  const disposeTex = (t)=>{
+    if (t && t.dispose) t.dispose();
+  };
+
+  const revokePreviewUrl = (matUuid)=>{
+    const m = runtime.previewUrlByMat.get(matUuid);
+    if (m && m.url){
+      try{ URL.revokeObjectURL(m.url); }catch(_){}
+    }
+    runtime.previewUrlByMat.delete(matUuid);
+  };
+
+  // -----------------------------
+  // Slider + Number helpers
+  // -----------------------------
+  const _num2 = (v)=>{
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "0.00";
+    return n.toFixed(2);
+  };
+
+  const _parseStep = (el, fallback=0.01)=>{
+    const s = parseFloat(el?.step ?? "");
+    return (Number.isFinite(s) && s > 0) ? s : fallback;
+  };
+
+  const _parseMinMax = (el)=>{
+    const mn = parseFloat(el?.min ?? "");
+    const mx = parseFloat(el?.max ?? "");
+    return {
+      min: Number.isFinite(mn) ? mn : 0,
+      max: Number.isFinite(mx) ? mx : 1,
+    };
+  };
+
+  const _quantizeToStep = (v, step)=>{
+    if (!Number.isFinite(v)) return 0;
+    const inv = 1 / step;
+    return Math.round(v * inv) / inv;
+  };
+
+  // commits a numeric field into slider+state (clamp + step quantize + 2 decimals)
+  const makeCommitNumber = ({ numEl, rangeEl, onValue })=>{
+    const step = _parseStep(rangeEl, 0.01);
+    const { min, max } = _parseMinMax(rangeEl);
+
+    return ()=>{
+      let v = parseFloat(numEl.value);
+      if (!Number.isFinite(v)) v = parseFloat(rangeEl.value);
+      v = clamp(v, min, max);
+      v = _quantizeToStep(v, step);
+      v = clamp(v, min, max);
+
+      // keep both in sync
+      rangeEl.value = String(v);
+      numEl.value = _num2(v);
+
+      onValue(v);
+    };
+  };
+
+  const bindRangeAndNumber = ({ rangeEl, numEl, onValue })=>{
+    const step = _parseStep(rangeEl, 0.01);
+    const { min, max } = _parseMinMax(rangeEl);
+
+    // Ensure number has the same constraints
+    numEl.min = String(min);
+    numEl.max = String(max);
+    numEl.step = String(step);
+
+    // Range -> Number (live)
+    rangeEl.addEventListener("input", ()=>{
+      let v = parseFloat(rangeEl.value);
+      if (!Number.isFinite(v)) v = min;
+      v = clamp(v, min, max);
+      v = _quantizeToStep(v, step);
+      v = clamp(v, min, max);
+      numEl.value = _num2(v);
+      onValue(v);
+    });
+
+    // Number -> Range (commit)
+    const commit = makeCommitNumber({ numEl, rangeEl, onValue });
+
+    numEl.addEventListener("change", commit);
+    numEl.addEventListener("blur", commit);
+    numEl.addEventListener("keydown", (e)=>{
+      if (e.key === "Enter"){
+        e.preventDefault();
+        commit();
+        numEl.blur();
+      }
+    });
+
+    return { commit };
+  };
+
+  // -----------------------------
+  // Texture transform (UV stability)
+  // -----------------------------
+  const cloneTexParamsFrom = (tex)=>{
+    if (!tex) return null;
+    const rep = tex.repeat || { x:1, y:1 };
+    const off = tex.offset || { x:0, y:0 };
+    const cen = tex.center || { x:0, y:0 };
+    return {
+      flipY: !!tex.flipY,
+      wrapS: tex.wrapS,
+      wrapT: tex.wrapT,
+      repeatX: rep.x, repeatY: rep.y,
+      offsetX: off.x, offsetY: off.y,
+      rotation: tex.rotation || 0,
+      centerX: cen.x, centerY: cen.y,
+    };
+  };
+
+  const applyTexParams = (tex, p)=>{
+    if (!tex || !p) return;
+    // flipY is intentionally NOT forced unless explicitly provided
+    if (typeof p.flipY === "boolean") tex.flipY = p.flipY;
+    tex.wrapS = p.wrapS;
+    tex.wrapT = p.wrapT;
+    if (tex.repeat) tex.repeat.set(p.repeatX, p.repeatY);
+    if (tex.offset) tex.offset.set(p.offsetX, p.offsetY);
+    tex.rotation = p.rotation || 0;
+    if (tex.center) tex.center.set(p.centerX, p.centerY);
+    tex.needsUpdate = true;
+  };
+
+  const setExpectedParams = (matUuid, slot, params)=>{
+    if (!runtime.expectByMat.has(matUuid)) runtime.expectByMat.set(matUuid, {});
+    const e = runtime.expectByMat.get(matUuid);
+    e[slot] = params;
+  };
+
+  const getExpectedParams = (matUuid, slot)=>{
+    const e = runtime.expectByMat.get(matUuid);
+    return (e && e[slot]) ? e[slot] : null;
+  };
+
+  const defaultTexParams = ()=>{
+    return {
+      // flipY is left unspecified to respect loader-specific defaults
+      wrapS:THREE.ClampToEdgeWrapping,
+      wrapT:THREE.ClampToEdgeWrapping,
+      repeatX:1, repeatY:1,
+      offsetX:0, offsetY:0,
+      rotation:0,
+      centerX:0, centerY:0
+    };
+  };
+
+  // Prefer slot's existing params; fallback to baseColor params; then default.
+  const getOrCaptureExpectedParams = (mat, matUuid, slot)=>{
+    const cached = getExpectedParams(matUuid, slot);
+    if (cached) return cached;
+
+    // Try from actual existing map on material
+    let tex = null;
+    if (slot === "baseColor") tex = mat.map;
+    else if (slot === "metalness") tex = mat.metalnessMap;
+    else if (slot === "roughness") tex = mat.roughnessMap;
+    else if (slot === "normal") tex = mat.normalMap;
+    else if (slot === "ao") tex = mat.aoMap;
+    else if (slot === "emission") tex = mat.emissiveMap;
+    else if (slot === "specularF0") tex = (("specularIntensityMap" in mat) ? mat.specularIntensityMap : null);
+    else if (slot === "clearcoat") tex = ("clearcoatMap" in mat ? mat.clearcoatMap : null);
+    else if (slot === "clearcoatRoughness") tex = ("clearcoatRoughnessMap" in mat ? mat.clearcoatRoughnessMap : null);
+
+    const p1 = cloneTexParamsFrom(tex);
+    if (p1){ setExpectedParams(matUuid, slot, p1); return p1; }
+
+    const pBase = getExpectedParams(matUuid, "baseColor");
+    if (pBase) return pBase;
+
+    return defaultTexParams();
+  };
+
+  // THREE colorSpace helper (version-safe)
+  const setColorSpace = (tex, kind)=>{
+    // kind: "srgb" | "data"
+    if (!tex) return;
+    if (kind === "srgb"){
+      tex.colorSpace = THREE.SRGBColorSpace;
+    } else {
+      tex.colorSpace = (THREE.NoColorSpace != null) ? THREE.NoColorSpace : THREE.LinearSRGBColorSpace;
+    }
+    tex.needsUpdate = true;
+  };
+
+  async function loadTextureFromFile(file, kind, expectedParams){
+    const url = URL.createObjectURL(file);
+    try{
+      const tex = await runtime.texLoader.loadAsync(url);
+      setColorSpace(tex, kind);
+
+      // IMPORTANT: keep UV transform stable
+      const p = expectedParams || defaultTexParams();
+      applyTexParams(tex, p);
+
+      return { tex, urlForPreview: url };
+    } catch(err){
+      try{ URL.revokeObjectURL(url); }catch(_){}
+      throw err;
+    }
+  }
+
+  const isPBRLit = ()=>{
+    return !!model.currentModel && state.rendererMode === "pbr" && state.shadingMode === "lit";
+  };
+
+  // -----------------------------
+  // FBX detection + one-time prepare
+  // -----------------------------
+  function detectLoadedExt(){
+    const pickStr = (v)=>{
+      if (!v) return "";
+      if (typeof v === "string") return v;
+      return "";
+    };
+
+    const candidates = [
+      pickStr(state?.loadedExt),
+      pickStr(state?.modelExt),
+      pickStr(state?.fileExt),
+      pickStr(state?.importExt),
+      pickStr(state?.import?.ext),
+      pickStr(state?.import?.lastExt),
+      pickStr(state?.import?.currentExt),
+      pickStr(viewer?.modules?.import?.lastExt),
+      pickStr(viewer?.modules?.import?.currentExt),
+      pickStr(viewer?.modules?.loader?.lastExt),
+      pickStr(model?.currentModel?.userData?.sourceExt),
+      pickStr(model?.currentModel?.userData?.fileExt),
+      pickStr(model?.currentModel?.userData?.ext),
+      pickStr(model?.currentModel?.userData?.format),
+    ].map(s=> (s||"").toLowerCase().trim()).filter(Boolean);
+
+    for (const s of candidates){
+      if (s === "fbx") return "fbx";
+      if (s.endsWith(".fbx")) return "fbx";
+    }
+
+    const nameCandidates = [
+      pickStr(state?.loadedName),
+      pickStr(state?.modelName),
+      pickStr(state?.fileName),
+      pickStr(state?.import?.fileName),
+      pickStr(viewer?.modules?.import?.lastName),
+      pickStr(model?.currentModel?.name),
+      pickStr(model?.currentModel?.userData?.name),
+    ].map(s=> (s||"").toLowerCase().trim()).filter(Boolean);
+
+    for (const n of nameCandidates){
+      if (n.endsWith(".fbx")) return "fbx";
+    }
+
+    return "";
+  }
+
+  function updateModelFormatFlags(){
+    const ext = detectLoadedExt();
+    runtime.modelIsFBX = (ext === "fbx");
+  }
+
+  function recomputeVertexNormalsForFBX(root){
+    if (!root) return;
+    const seen = new Set();
+    root.traverse(o=>{
+      if (!o.isMesh || !o.geometry) return;
+      const g = o.geometry;
+      if (seen.has(g.uuid)) return;
+      seen.add(g.uuid);
+      try{
+        g.computeVertexNormals();
+        if (g.normalizeNormals) g.normalizeNormals();
+        if (g.attributes && g.attributes.normal) g.attributes.normal.needsUpdate = true;
+      } catch(_){}
+    });
+  }
+
+  // 重要: 今回は「FBXの同梱normal/roughnessを消さない」方針。
+  // ここでは何もしない（残しておく）
+  function disableFBXDefaultMaps(root){
+    // no-op by design
+    void root;
+  }
+
+  function prepareFBXIfNeeded(){
+    updateModelFormatFlags();
+    const root = model.currentModel;
+    if (!root) return;
+
+    // reset per-load
+    if (!runtime.modelIsFBX){
+      runtime.fbxPrepared = false;
+      return;
+    }
+
+    if (runtime.fbxPrepared) return;
+
+    // 1) FBX only: recompute vertex normals
+    recomputeVertexNormalsForFBX(root);
+
+    // 2) FBX only: DO NOT delete embedded maps
+    disableFBXDefaultMaps(root);
+
+    runtime.fbxPrepared = true;
+  }
+
+  // Collect ALL materials in current model (flatten arrays)
+  function collectMaterialsInModel(root){
+    const arr = [];
+    const seen = new Set();
+    if (!root) return arr;
+
+    root.traverse(o=>{
+      if (!o.isMesh) return;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats){
+        if (!m) continue;
+        if (seen.has(m.uuid)) continue;
+        seen.add(m.uuid);
+        arr.push(m);
+      }
+    });
+    return arr;
+  }
+
+  function getMeshesUsingMaterial(root, mat){
+    const meshes = [];
+    if (!root || !mat) return meshes;
+    root.traverse(o=>{
+      if (!o.isMesh) return;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      if (mats.includes(mat)) meshes.push(o);
+    });
+    return meshes;
+  }
+
+  // AO needs uv2
+  function ensureUV2(mesh){
+    const g = mesh.geometry;
+    if (!g) return false;
+    const uv = g.attributes?.uv;
+    const uv2 = g.attributes?.uv2;
+    if (uv && !uv2){
+      const arr = (uv.array && uv.array.slice) ? uv.array.slice() : uv.array;
+      g.setAttribute("uv2", new THREE.BufferAttribute(arr, 2));
+      return true;
+    }
+    return false;
+  }
+
+  // -----------------------------
+  // Material conversions (minimum)
+  // -----------------------------
+  function convertToStandard(oldMat){
+    const sm = new THREE.MeshStandardMaterial();
+
+    sm.name = oldMat.name || sm.name;
+
+    // copy common colors
+    if (oldMat.color && sm.color) sm.color.copy(oldMat.color);
+    if (oldMat.emissive && sm.emissive) sm.emissive.copy(oldMat.emissive);
+
+    const copyIf = (k)=>{
+      if (oldMat[k] != null && (k in sm)) sm[k] = oldMat[k];
+    };
+
+    // maps we care about
+    const mapKeys = [
+      "map","metalnessMap","roughnessMap","normalMap","aoMap","emissiveMap","alphaMap"
+    ];
+    for (const k of mapKeys){
+      if (oldMat[k] != null && (k in sm)) sm[k] = oldMat[k];
+    }
+
+    // scalars / flags
+    const keys = [
+      "metalness","roughness","emissiveIntensity",
+      "transparent","opacity","side","alphaTest",
+      "depthTest","depthWrite","polygonOffset","polygonOffsetFactor","polygonOffsetUnits",
+      "wireframe","envMapIntensity"
+    ];
+
+    for (const k of keys) copyIf(k);
+
+    if (oldMat.normalScale && sm.normalScale) sm.normalScale.copy(oldMat.normalScale);
+
+    sm.userData = Object.assign({}, oldMat.userData || {});
+    sm.vertexColors = false;
+    sm.needsUpdate = true;
+    return sm;
+  }
+
+  function convertToPhysical(oldMat){
+    const pm = new THREE.MeshPhysicalMaterial();
+
+    pm.name = oldMat.name || pm.name;
+
+    if (oldMat.color && pm.color) pm.color.copy(oldMat.color);
+    if (oldMat.emissive && pm.emissive) pm.emissive.copy(oldMat.emissive);
+
+    const copyIf = (k)=>{
+      if (oldMat[k] != null && (k in pm)) pm[k] = oldMat[k];
+    };
+
+    const mapKeys = [
+      "map","metalnessMap","roughnessMap","normalMap","aoMap","emissiveMap","alphaMap"
+    ];
+    for (const k of mapKeys){
+      if (oldMat[k] != null && (k in pm)) pm[k] = oldMat[k];
+    }
+
+    const keys = [
+      "metalness","roughness","emissiveIntensity",
+      "transparent","opacity","side","alphaTest",
+      "depthTest","depthWrite","polygonOffset","polygonOffsetFactor","polygonOffsetUnits",
+      "wireframe","vertexColors","envMapIntensity"
+    ];
+    for (const k of keys) copyIf(k);
+
+    if (oldMat.normalScale && pm.normalScale) pm.normalScale.copy(oldMat.normalScale);
+    pm.vertexColors = false;
+    pm.userData = Object.assign({}, oldMat.userData || {});
+    pm.needsUpdate = true;
+    return pm;
+  }
+
+  function replaceMaterialEverywhere(root, oldMat, newMat){
+    if (!root || !oldMat || !newMat) return;
+    root.traverse(o=>{
+      if (!o.isMesh) return;
+      if (Array.isArray(o.material)){
+        const a = o.material.slice();
+        let changed = false;
+        for (let i=0;i<a.length;i++){
+          if (a[i] && a[i].uuid === oldMat.uuid){
+            a[i] = newMat;
+            changed = true;
+          }
+        }
+        if (changed) o.material = a;
+      } else {
+        if (o.material && o.material.uuid === oldMat.uuid){
+          o.material = newMat;
+        }
+      }
+    });
+  }
+
+  function moveRuntimeForUuid(oldUuid, newUuid){
+    ensureStateRoot();
+
+    // Preserve selection
+    if (state.material.selectedUuid === oldUuid){
+      state.material.selectedUuid = newUuid;
+    }
+
+    // move state buckets
+    if (state.material.byMat && state.material.byMat[oldUuid]){
+      state.material.byMat[newUuid] = state.material.byMat[oldUuid];
+      delete state.material.byMat[oldUuid];
+    }
+
+    // runtime stores
+    if (runtime.texByMat.has(oldUuid)){
+      runtime.texByMat.set(newUuid, runtime.texByMat.get(oldUuid));
+      runtime.texByMat.delete(oldUuid);
+    }
+    if (runtime.touchedByMat.has(oldUuid)){
+      runtime.touchedByMat.set(newUuid, runtime.touchedByMat.get(oldUuid));
+      runtime.touchedByMat.delete(oldUuid);
+    }
+    if (runtime.expectByMat.has(oldUuid)){
+      runtime.expectByMat.set(newUuid, runtime.expectByMat.get(oldUuid));
+      runtime.expectByMat.delete(oldUuid);
+    }
+    if (runtime.previewUrlByMat.has(oldUuid)){
+      runtime.previewUrlByMat.set(newUuid, runtime.previewUrlByMat.get(oldUuid));
+      runtime.previewUrlByMat.delete(oldUuid);
+    }
+    if (runtime.origMapByMat.has(oldUuid)){
+      runtime.origMapByMat.set(newUuid, runtime.origMapByMat.get(oldUuid));
+      runtime.origMapByMat.delete(oldUuid);
+    }
+  }
+
+  function ensureStandardForMR(mat){
+    if (!mat) return mat;
+
+    // If already physical, ok
+    if (mat.isMeshPhysicalMaterial) return mat;
+
+    // If it already has metalness/roughness, no need
+    if (("metalness" in mat) && ("roughness" in mat)) return mat;
+
+    const root = model.currentModel;
+    const oldUuid = mat.uuid;
+
+    const newMat = convertToStandard(mat);
+    replaceMaterialEverywhere(root, mat, newMat);
+
+    // Update rendering module's original-material DB (so swapping renderer doesn't revert)
+    if (viewer.modules?.rendering?.collectOriginalMaterials){
+      viewer.modules.rendering.collectOriginalMaterials(root);
+      viewer.modules.rendering.invalidateMatcapOverrides?.();
+      viewer.modules.rendering.applyDisplayMode?.();
+    }
+
+    moveRuntimeForUuid(oldUuid, newMat.uuid);
+
+    mat.dispose?.();
+    return newMat;
+  }
+
+  function ensurePhysicalForSpec(mat){
+    if (!mat) return mat;
+    if (mat.isMeshPhysicalMaterial) return mat;
+
+    if ("specularIntensity" in mat) return mat;
+
+    const root = model.currentModel;
+    const oldUuid = mat.uuid;
+
+    const newMat = convertToPhysical(mat);
+    replaceMaterialEverywhere(root, mat, newMat);
+
+    // Update rendering module's original-material DB so swaps don't revert our replacement.
+    if (viewer.modules?.rendering?.collectOriginalMaterials){
+      viewer.modules.rendering.collectOriginalMaterials(root);
+      viewer.modules.rendering.invalidateMatcapOverrides?.();
+      viewer.modules.rendering.applyDisplayMode?.();
+    }
+
+    moveRuntimeForUuid(oldUuid, newMat.uuid);
+
+    mat.dispose?.();
+    return newMat;
+  }
+
+  // Force PBR-material type for ALL materials in model (keep thereafter)
+  function ensureAllMaterialsArePBR(){
+    const root = model.currentModel;
+    if (!root) return;
+
+    const mats = collectMaterialsInModel(root);
+    for (const m of mats){
+      let mat = m;
+
+      // 1) ensure metal/rough slot exists
+      if (!mat.isMeshPhysicalMaterial && (!("metalness" in mat) || !("roughness" in mat))){
+        mat = ensureStandardForMR(mat);
+      }
+
+      // 2) ensure specularIntensity exists (Physical)
+      if (!mat.isMeshPhysicalMaterial){
+        mat = ensurePhysicalForSpec(mat);
+      }
+
+      // Ensure state buckets exist (after potential uuid replacement)
+      getOrCreateMatState(mat.uuid);
+      getOrCreateRuntimeTex(mat.uuid);
+      getOrCreateTouched(mat.uuid);
+      getOrCreateOrigMaps(mat.uuid);
+    }
+  }
+
+  // -----------------------------
+  // UI (inject into sidebar)
+  // -----------------------------
+  const sideBody = document.getElementById("sideBody");
+  if (!sideBody) throw new Error("sideBody not found");
+
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML = `
+    <div class="secHead"><span>Material</span></div>
+    <div class="secBody" id="matBody">
+      <div class="field">
+        <label>Target</label>
+        <select id="matTarget"></select>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button id="btnApplyAll">Apply all</button>
+      </div>
+
+      <div class="hint" id="matGateHint"></div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Base Color</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnBC">Import...</button>
+            <button id="btnRmBC" style="display:none">Remove</button>
+            <span class="hint" id="nameBC">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbBC" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+        
+          <div class="row" style="margin-top:8px;">
+            <label class="pill">
+              <input type="checkbox" id="chkBCFlipY" />
+              Flip Y (UV)
+            </label>
+          </div>
+</div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Metalness</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnM">Import...</button>
+            <button id="btnRmM" style="display:none">Remove</button>
+            <span class="hint" id="nameM">(none)</span>
+          </div>
+           <div class="row" style="margin-top:8px;">
+            <img id="thumbM" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slM" type="range" min="0" max="1" step="0.01" value="0" style="flex:1;">
+              <input id="numM" type="number" min="0" max="1" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Specular F0</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnS">Import...</button>
+            <button id="btnRmS" style="display:none">Remove</button>
+            <span class="hint" id="nameS">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbS" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slS" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;">
+              <input id="numS" type="number" min="0" max="1" step="0.01" value="0.50"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Roughness</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnR">Import...</button>
+            <button id="btnRmR" style="display:none">Remove</button>
+            <span class="hint" id="nameR">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbR" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slR" type="range" min="0" max="1" step="0.01" value="1" style="flex:1;">
+              <input id="numR" type="number" min="0" max="1" step="0.01" value="1.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Normal map</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnN">Import...</button>
+            <button id="btnRmN" style="display:none">Remove</button>
+            <span class="hint" id="nameN">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbN" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slN" type="range" min="0" max="5" step="0.01" value="0" style="flex:1;">
+              <input id="numN" type="number" min="0" max="5" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+          <div class="row">
+            <label class="pill">
+              <input type="checkbox" id="chkFlipG" />
+              Flip Green (Y)
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Ambient Occlusion</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnAO">Import...</button>
+            <button id="btnRmAO" style="display:none">Remove</button>
+            <span class="hint" id="nameAO">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbAO" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slAO" type="range" min="0" max="2" step="0.01" value="0" style="flex:1;">
+              <input id="numAO" type="number" min="0" max="2" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+          <div class="hint">uv2が無い場合はuvを複製して自動生成します</div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Emission</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnE">Import...</button>
+            <button id="btnRmE" style="display:none">Remove</button>
+            <span class="hint" id="nameE">(none)</span>
+          </div>
+           <div class="row" style="margin-top:8px;">
+            <img id="thumbE" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slE" type="range" min="0" max="10" step="0.01" value="0" style="flex:1;">
+              <input id="numE" type="number" min="0" max="10" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Clearcoat</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnCC">Import...</button>
+            <button id="btnRmCC" style="display:none">Remove</button>
+            <span class="hint" id="nameCC">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbCC" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slCC" type="range" min="0" max="1" step="0.01" value="0" style="flex:1;">
+              <input id="numCC" type="number" min="0" max="1" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="border-radius:10px">
+        <div class="secHead"><span>Clearcoat Roughness</span></div>
+        <div class="secBody">
+          <div class="row" style="gap:10px; align-items:center;">
+            <button id="btnCCR">Import...</button>
+            <button id="btnRmCCR" style="display:none">Remove</button>
+            <span class="hint" id="nameCCR">(none)</span>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <img id="thumbCCR" alt="" style="width:100%;max-height:160px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#0f0f0f;display:none" />
+          </div>
+          <div class="field">
+            <label>Strength</label>
+            <div class="row" style="gap:10px; align-items:center;">
+              <input id="slCCR" type="range" min="0" max="1" step="0.01" value="0" style="flex:1;">
+              <input id="numCCR" type="number" min="0" max="1" step="0.01" value="0.00"
+                style="width:90px;background:#0f0f0f;border:1px solid var(--line);color:var(--fg);
+                       padding:8px 10px;border-radius:10px;font-size:12px;outline:none;">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const cameraSection = [...sideBody.querySelectorAll(".section")].find(s=>{
+    const h = s.querySelector(".secHead");
+    return h && (h.textContent || "").includes("Camera");
+  });
+  if (cameraSection) sideBody.insertBefore(sec, cameraSection);
+  else sideBody.appendChild(sec);
+
+  // hidden file input (shared)
+  const texInput = document.createElement("input");
+  texInput.type = "file";
+  texInput.accept = ".png,.jpg,.jpeg,.webp,.bmp,.tga,.gif,.ktx2,.dds";
+  texInput.style.position = "fixed";
+  texInput.style.left = "-9999px";
+  texInput.style.top = "-9999px";
+  texInput.style.width = "1px";
+  texInput.style.height = "1px";
+  texInput.style.opacity = "0";
+  document.body.appendChild(texInput);
+
+  const ui = {
+    sec,
+    matTarget: sec.querySelector("#matTarget"),
+    btnApplyAll: sec.querySelector("#btnApplyAll"),
+    matGateHint: sec.querySelector("#matGateHint"),
+
+    btnBC: sec.querySelector("#btnBC"),
+    btnRmBC: sec.querySelector("#btnRmBC"),
+    nameBC: sec.querySelector("#nameBC"),
+    thumbBC: sec.querySelector("#thumbBC"),
+    chkBCFlipY: sec.querySelector("#chkBCFlipY"),
+
+    btnM: sec.querySelector("#btnM"),
+    btnRmM: sec.querySelector("#btnRmM"),
+    nameM: sec.querySelector("#nameM"),
+    thumbM: sec.querySelector("#thumbM"),
+    slM: sec.querySelector("#slM"),
+    numM: sec.querySelector("#numM"),
+
+    btnS: sec.querySelector("#btnS"),
+    btnRmS: sec.querySelector("#btnRmS"),
+    nameS: sec.querySelector("#nameS"),
+    thumbS: sec.querySelector("#thumbS"),
+    slS: sec.querySelector("#slS"),
+    numS: sec.querySelector("#numS"),
+
+    btnR: sec.querySelector("#btnR"),
+    btnRmR: sec.querySelector("#btnRmR"),
+    nameR: sec.querySelector("#nameR"),
+    thumbR: sec.querySelector("#thumbR"),
+    slR: sec.querySelector("#slR"),
+    numR: sec.querySelector("#numR"),
+
+    btnN: sec.querySelector("#btnN"),
+    btnRmN: sec.querySelector("#btnRmN"),
+    nameN: sec.querySelector("#nameN"),
+    thumbN: sec.querySelector("#thumbN"),
+    slN: sec.querySelector("#slN"),
+    numN: sec.querySelector("#numN"),
+    chkFlipG: sec.querySelector("#chkFlipG"),
+
+    btnAO: sec.querySelector("#btnAO"),
+    btnRmAO: sec.querySelector("#btnRmAO"),
+    nameAO: sec.querySelector("#nameAO"),
+    thumbAO: sec.querySelector("#thumbAO"),
+    slAO: sec.querySelector("#slAO"),
+    numAO: sec.querySelector("#numAO"),
+
+    btnE: sec.querySelector("#btnE"),
+    btnRmE: sec.querySelector("#btnRmE"),
+    nameE: sec.querySelector("#nameE"),
+    thumbE: sec.querySelector("#thumbE"),
+    slE: sec.querySelector("#slE"),
+    numE: sec.querySelector("#numE"),
+
+    btnCC:   sec.querySelector("#btnCC"),
+    btnRmCC: sec.querySelector("#btnRmCC"),
+    nameCC:  sec.querySelector("#nameCC"),
+    thumbCC: sec.querySelector("#thumbCC"),
+    slCC:    sec.querySelector("#slCC"),
+    numCC:   sec.querySelector("#numCC"),
+
+    btnCCR:   sec.querySelector("#btnCCR"),
+    btnRmCCR: sec.querySelector("#btnRmCCR"),
+    nameCCR:  sec.querySelector("#nameCCR"),
+    thumbCCR: sec.querySelector("#thumbCCR"),
+    slCCR:    sec.querySelector("#slCCR"),
+    numCCR:   sec.querySelector("#numCCR"),
+  };
+
+  let pendingKind = null; // which texture slot is being imported
+
+  const allControls = [
+    ui.matTarget,
+    ui.btnApplyAll,
+    ui.btnBC, ui.btnRmBC, ui.chkBCFlipY,
+
+    ui.btnM, ui.btnRmM, ui.slM, ui.numM,
+    ui.btnS, ui.btnRmS, ui.slS, ui.numS,
+    ui.btnR, ui.btnRmR, ui.slR, ui.numR,
+
+    ui.btnN, ui.btnRmN, ui.slN, ui.numN, ui.chkFlipG,
+    ui.btnAO, ui.btnRmAO, ui.slAO, ui.numAO,
+    ui.btnE, ui.btnRmE, ui.slE, ui.numE,
+
+    ui.btnCC, ui.btnRmCC, ui.slCC, ui.numCC,
+    ui.btnCCR, ui.btnRmCCR, ui.slCCR, ui.numCCR,
+  ];
+
+  function setUIEnabled(enabled){
+    for (const el of allControls){
+      if (!el) continue;
+      el.disabled = !enabled;
+    }
+  }
+
+  function updateGateHint(){
+    if (!model.currentModel){
+      ui.matGateHint.textContent = "モデル未読み込み";
+      return;
+    }
+    if (state.rendererMode !== "pbr"){
+      ui.matGateHint.textContent = "Materialは PBR + Lit のときのみ有効（Matcap中は無効）";
+      return;
+    }
+    if (state.shadingMode !== "lit"){
+      ui.matGateHint.textContent = "Materialは PBR + Lit のときのみ有効（Unlit中は無効）";
+      return;
+    }
+    ui.matGateHint.textContent = "";
+  }
+
+  // -----------------------------
+  // Apply (IMPORTANT: selection change does NOT apply)
+  // -----------------------------
+  function getSelectedMaterial(){
+    const uuid = ui.matTarget.value || "";
+    if (!uuid || !model.currentModel) return null;
+    const mats = collectMaterialsInModel(model.currentModel);
+    return mats.find(m=> m.uuid === uuid) || null;
+  }
+
+  function applyToMaterial(mat){
+    if (!mat) return false;
+
+    let replaced = false;
+    let dirty = false;
+
+    let matUuid = mat.uuid;
+    let ms = getOrCreateMatState(matUuid);
+    let rt = getOrCreateRuntimeTex(matUuid);
+
+    // Always keep PBR material type:
+    // 1) ensure metal/rough exist (Standard)
+    if (!mat.isMeshPhysicalMaterial && (!("metalness" in mat) || !("roughness" in mat))){
+      const m2 = ensureStandardForMR(mat);
+      if (m2 && m2 !== mat){
+        replaced = true;
+        mat = m2;
+        matUuid = mat.uuid;
+        ms = getOrCreateMatState(matUuid);
+        rt = getOrCreateRuntimeTex(matUuid);
+      }
+    }
+
+    // 2) ensure specularIntensity exists (Physical)
+    if (!mat.isMeshPhysicalMaterial){
+      const m2 = ensurePhysicalForSpec(mat);
+      if (m2 && m2 !== mat){
+        replaced = true;
+        mat = m2;
+        matUuid = mat.uuid;
+        ms = getOrCreateMatState(matUuid);
+        rt = getOrCreateRuntimeTex(matUuid);
+      }
+    }
+
+    // BaseColor:
+    // - ONLY touch mat.map when user actually imported baseColor texture.
+    // - Otherwise DO NOT TOUCH embedded GLB/FBX map.
+    if (rt.baseColorTex){
+      if (mat.map !== rt.baseColorTex){ mat.map = rt.baseColorTex; dirty = true; }
+      if (mat.color && (mat.color.r !== 1 || mat.color.g !== 1 || mat.color.b !== 1)){ mat.color.set(0xffffff); }
+    }
+    // BaseColor flipY override (per-material)
+    if (mat.map && typeof ms.baseColor.flipYOverride === "boolean"){
+      if (mat.map.flipY !== ms.baseColor.flipYOverride){ mat.map.flipY = ms.baseColor.flipYOverride; mat.map.needsUpdate = true; dirty = true; }
+    }
+
+
+    // Metalness (always)
+    if (rt.metalnessTex && mat.metalnessMap !== rt.metalnessTex){ mat.metalnessMap = rt.metalnessTex; dirty = true; }
+    if ("metalness" in mat){
+      const v = clamp(ms.metalness.strength ?? 0.0, 0, 1);
+      if (mat.metalness !== v){ mat.metalness = v; }
+    }
+
+    // Roughness:
+    // - If user imported roughness, apply it.
+    // - Else DO NOT TOUCH existing embedded roughnessMap (FBX含む)
+    if (rt.roughnessTex){
+      if (mat.roughnessMap !== rt.roughnessTex){ mat.roughnessMap = rt.roughnessTex; dirty = true; }
+    }
+    if ("roughness" in mat){
+      const v = clamp(ms.roughness.strength ?? 1.0, 0, 1);
+      if (mat.roughness !== v){ mat.roughness = v; }
+    }
+
+    // SpecularF0 (always; Physical required)
+    if ("specularIntensity" in mat){
+      const v = clamp(ms.specularF0.strength ?? 0.5, 0, 1);
+      if (mat.specularIntensity !== v){ mat.specularIntensity = v; }
+    }
+    if (rt.specTex){
+      if ("specularIntensityMap" in mat && mat.specularIntensityMap !== rt.specTex){ mat.specularIntensityMap = rt.specTex; dirty = true; }
+      if ("specularColor" in mat && mat.specularColor && (mat.specularColor.r !== 1 || mat.specularColor.g !== 1 || mat.specularColor.b !== 1)) mat.specularColor.set(0xffffff);
+    }
+
+    // Normal:
+    // - If user imported normal, apply it.
+    // - Else DO NOT TOUCH existing embedded normalMap (FBX含む)
+    if (rt.normalTex){
+      if (mat.normalMap !== rt.normalTex){ mat.normalMap = rt.normalTex; dirty = true; }
+    }
+    if (mat.normalScale){
+      const s0 = clamp(ms.normal.strength ?? 0.0, 0, 5);
+      const flip = !!ms.normal.flipGreen;
+      const ny = flip ? -s0 : s0;
+      if (mat.normalScale.x !== s0 || mat.normalScale.y !== ny){ mat.normalScale.set(s0, ny); }
+    }
+
+    // AO (always: intensity controls ON/OFF; aoMap only when imported)
+    if (rt.aoTex && mat.aoMap !== rt.aoTex){ mat.aoMap = rt.aoTex; dirty = true; }
+    if ("aoMapIntensity" in mat){
+      const v = clamp(ms.ao.strength ?? 0.0, 0, 2);
+      if (mat.aoMapIntensity !== v){ mat.aoMapIntensity = v; }
+    }
+
+    // Emission (slider 0 disables; map only when imported)
+    if (rt.emisTex && mat.emissiveMap !== rt.emisTex){ mat.emissiveMap = rt.emisTex; dirty = true; }
+    if (mat.emissive && (mat.emissive.r !== 1 || mat.emissive.g !== 1 || mat.emissive.b !== 1)) mat.emissive.set(0xffffff);
+    if ("emissiveIntensity" in mat){
+      const v = clamp(ms.emission.strength ?? 0.0, 0, 10);
+      if (mat.emissiveIntensity !== v){ mat.emissiveIntensity = v; }
+    }
+
+    // Clearcoat (Physical only)
+    if ("clearcoat" in mat){
+      const v = clamp(ms.clearcoat?.strength ?? 0.0, 0, 1);
+      if (mat.clearcoat !== v){ mat.clearcoat = v; }
+    }
+    if (rt.clearcoatTex && "clearcoatMap" in mat && mat.clearcoatMap !== rt.clearcoatTex){
+      mat.clearcoatMap = rt.clearcoatTex; dirty = true;
+    }
+
+    if ("clearcoatRoughness" in mat){
+      const v = clamp(ms.clearcoatRoughness?.strength ?? 0.0, 0, 1);
+      if (mat.clearcoatRoughness !== v){ mat.clearcoatRoughness = v; }
+    }
+    if (rt.clearcoatRoughnessTex && "clearcoatRoughnessMap" in mat && mat.clearcoatRoughnessMap !== rt.clearcoatRoughnessTex){
+      mat.clearcoatRoughnessMap = rt.clearcoatRoughnessTex; dirty = true;
+    }
+
+    if (dirty) mat.needsUpdate = true;
+    return replaced;
+  }
+
+  function applySelected(){
+    if (!isPBRLit()) return;
+
+    const before = ui.matTarget.value || "";
+    let mat = getSelectedMaterial();
+    if (!mat) return;
+
+    const meshes0 = getMeshesUsingMaterial(model.currentModel, mat);
+    for (const mesh of meshes0) ensureUV2(mesh);
+
+    const replaced = applyToMaterial(mat);
+
+    // If material was replaced (uuid changed), rebuild list so UI matches reality.
+    if (replaced && state.material.selectedUuid && state.material.selectedUuid !== before){
+      rebuildMaterialTargetList();
+      // re-apply once to make sure scalar values/maps stick on the new material instance
+      const mat2 = getSelectedMaterial();
+      if (mat2){
+        const meshes1 = getMeshesUsingMaterial(model.currentModel, mat2);
+        for (const mesh of meshes1) ensureUV2(mesh);
+        applyToMaterial(mat2);
+      }
+    }
+
+    emit("material-changed", { materialUuid: ui.matTarget.value });
+  }
+
+  function applyAllFromSelected(){
+    if (!isPBRLit()) return;
+
+    const selected = getSelectedMaterial();
+    if (!selected || !model.currentModel) return;
+
+    const srcUuid = selected.uuid;
+    const src = getOrCreateMatState(srcUuid);
+
+    const srcVals = {
+      baseColorFlipY: !!ui.chkBCFlipY.checked,
+      normalFlipGreen: !!ui.chkFlipG.checked,
+      metalness: clamp(src.metalness?.strength ?? 0.0, 0, 1),
+      roughness: clamp(src.roughness?.strength ?? 1.0, 0, 1),
+      specularF0: clamp(src.specularF0?.strength ?? 0.5, 0, 1),
+      normal: clamp(src.normal?.strength ?? 0.0, 0, 5),
+      ao: clamp(src.ao?.strength ?? 0.0, 0, 2),
+      emission: clamp(src.emission?.strength ?? 0.0, 0, 10),
+      clearcoat: clamp(src.clearcoat?.strength ?? 0.0, 0, 1),
+      clearcoatRoughness: clamp(src.clearcoatRoughness?.strength ?? 0.0, 0, 1),
+    };
+
+    prepareFBXIfNeeded();
+    ensureAllMaterialsArePBR();
+
+    const mats = collectMaterialsInModel(model.currentModel);
+    for (let m0 of mats){
+      if (!m0) continue;
+
+      // ensure target material type (uuid may change)
+      let m = ensureStandardForMR(m0);
+      m = ensurePhysicalForSpec(m);
+
+      const ms = getOrCreateMatState(m.uuid);
+
+      // copy ONLY requested scalar/flag values (keep imported images/names as-is)
+      const prevBaseFlip = (typeof ms.baseColor.flipYOverride === "boolean") ? ms.baseColor.flipYOverride : null;
+      const prevNormalFlip = !!ms.normal.flipGreen;
+      const prevM = clamp(ms.metalness.strength ?? 0.0, 0, 1);
+      const prevR = clamp(ms.roughness.strength ?? 1.0, 0, 1);
+      const prevS = clamp(ms.specularF0.strength ?? 0.5, 0, 1);
+      const prevN = clamp(ms.normal.strength ?? 0.0, 0, 5);
+      const prevAO = clamp(ms.ao.strength ?? 0.0, 0, 2);
+      const prevE = clamp(ms.emission.strength ?? 0.0, 0, 10);
+
+      const changed =
+        prevBaseFlip !== srcVals.baseColorFlipY ||
+        prevNormalFlip !== srcVals.normalFlipGreen ||
+        prevM !== srcVals.metalness ||
+        prevR !== srcVals.roughness ||
+        prevS !== srcVals.specularF0 ||
+        prevN !== srcVals.normal ||
+        prevAO !== srcVals.ao ||
+        prevE !== srcVals.emission ||
+        (ms.clearcoat?.strength ?? 0.0) !== srcVals.clearcoat ||
+        (ms.clearcoatRoughness?.strength ?? 0.0) !== srcVals.clearcoatRoughness;
+
+      if (!changed) continue;
+
+      ms.baseColor.flipYOverride = srcVals.baseColorFlipY;
+      ms.normal.flipGreen = srcVals.normalFlipGreen;
+
+      ms.metalness.strength = srcVals.metalness;
+      ms.roughness.strength = srcVals.roughness;
+      ms.specularF0.strength = srcVals.specularF0;
+      ms.normal.strength = srcVals.normal;
+      ms.ao.strength = srcVals.ao;
+      ms.emission.strength = srcVals.emission;
+
+      if (!ms.clearcoat) ms.clearcoat = { name: "", strength: 0.0 };
+      ms.clearcoat.strength = srcVals.clearcoat;
+      if (!ms.clearcoatRoughness) ms.clearcoatRoughness = { name: "", strength: 0.0 };
+      ms.clearcoatRoughness.strength = srcVals.clearcoatRoughness;
+
+      // Apply baseColor flipY immediately to currently assigned texture if present
+      if (m.map && m.map.flipY !== srcVals.baseColorFlipY){
+        m.map.flipY = srcVals.baseColorFlipY;
+        m.map.needsUpdate = true;
+        const p = cloneTexParamsFrom(m.map);
+        if (p) setExpectedParams(m.uuid, "baseColor", p);
+      }
+
+      // AO safety
+      if (srcVals.ao > 0){
+        const meshes = getMeshesUsingMaterial(model.currentModel, m);
+        for (const mesh of meshes) ensureUV2(mesh);
+      }
+
+      applyToMaterial(m);
+    }
+
+    // Keep current UI values visible and synced
+    syncUIFromState();
+    updateThumbnails(getSelectedMaterial());
+    emit("material-changed", { bulk: true, scope: "all", sourceMaterialUuid: srcUuid });
+  }
+
+  // -----------------------------
+  // UI sync (show embedded baseColor + others)
+  // -----------------------------
+  
+  // テクスチャからプレビューURLを生成（埋め込みBitmap対応）
+  function getTexturePreviewURL(tex) {
+    if (!tex || !tex.image) return null;
+    
+    // すでにURLを持っている場合（BlobURLなど）
+    if (typeof tex.image === "string") return tex.image;
+    if (typeof tex.image.src === "string" && tex.image.src.startsWith("blob:")) return tex.image.src;
+
+    // キャッシュをチェック
+    if (tex.userData && tex.userData.previewUrl) return tex.userData.previewUrl;
+
+    // ImageBitmap などを Canvas に描画して DataURL 化
+    if (tex.image instanceof ImageBitmap || tex.image instanceof HTMLImageElement || (typeof HTMLCanvasElement !== 'undefined' && tex.image instanceof HTMLCanvasElement)) {
+      try {
+        const w = tex.image.width;
+        const h = tex.image.height;
+        if (w === 0 || h === 0) return null;
+
+        const canvas = document.createElement("canvas");
+        // サムネイル用に少し縮小しても良いが、ここではそのまま
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(tex.image, 0, 0);
+        const url = canvas.toDataURL("image/png");
+        
+        // テクスチャオブジェクトにキャッシュしておく
+        if (!tex.userData) tex.userData = {};
+        tex.userData.previewUrl = url;
+        return url;
+      } catch (e) {
+        // Tainted canvas etc.
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function updateThumbnails(mat){
+    // Reset all
+    const slots = [
+      { key: "map",          el: ui.thumbBC, nameEl: ui.nameBC, stateKey: "baseColor" },
+      { key: "metalnessMap", el: ui.thumbM,  nameEl: ui.nameM,  stateKey: "metalness" },
+      { key: "roughnessMap", el: ui.thumbR,  nameEl: ui.nameR,  stateKey: "roughness" },
+      { key: "normalMap",    el: ui.thumbN,  nameEl: ui.nameN,  stateKey: "normal" },
+      { key: "aoMap",        el: ui.thumbAO, nameEl: ui.nameAO, stateKey: "ao" },
+      { key: "emissiveMap",  el: ui.thumbE,  nameEl: ui.nameE,  stateKey: "emission" },
+      { key: "clearcoatMap",          el: ui.thumbCC,  nameEl: ui.nameCC,  stateKey: "clearcoat" },
+      { key: "clearcoatRoughnessMap", el: ui.thumbCCR, nameEl: ui.nameCCR, stateKey: "clearcoatRoughness" },
+    ];
+
+    slots.forEach(s => {
+      s.el.style.display = "none";
+      s.el.removeAttribute("src");
+    });
+    ui.thumbS.style.display = "none";
+    ui.thumbS.removeAttribute("src");
+
+    // Reset all Remove buttons
+    const rmBtns = [ui.btnRmBC, ui.btnRmM, ui.btnRmS, ui.btnRmR, ui.btnRmN, ui.btnRmAO, ui.btnRmE, ui.btnRmCC, ui.btnRmCCR];
+    rmBtns.forEach(b => { if (b) b.style.display = "none"; });
+
+    if (!mat) {
+        slots.forEach(s => s.nameEl.textContent = "(none)");
+        ui.nameS.textContent = "(none)";
+        return;
+    }
+
+    const ms = getOrCreateMatState(mat.uuid);
+
+    // Helper to apply
+    const rmBtnMap = {
+      baseColor: ui.btnRmBC, metalness: ui.btnRmM, specularF0: ui.btnRmS,
+      roughness: ui.btnRmR, normal: ui.btnRmN, ao: ui.btnRmAO,
+      emission: ui.btnRmE, clearcoat: ui.btnRmCC, clearcoatRoughness: ui.btnRmCCR,
+    };
+
+    const applyThumb = (tex, el, nameEl, stateKeyName, texKeyName) => {
+      const rtNow = runtime.texByMat.get(mat.uuid);
+      const userImported = !!(rtNow && texKeyName && rtNow[texKeyName]);
+      const rmBtn = rmBtnMap[stateKeyName];
+      if (rmBtn) rmBtn.style.display = tex ? "" : "none";
+
+      if (tex) {
+        const url = getTexturePreviewURL(tex);
+        if (url) {
+          el.src = url;
+          el.style.display = "";
+        }
+
+        // 名前表示:
+        // - ユーザーが「このマテリアルのこのスロット」にインポートした場合のみ state の name を優先
+        // - それ以外は、実際にマテリアルが参照しているテクスチャ名（埋め込み等）を表示
+        const userSetName = userImported ? (ms[stateKeyName]?.name || "") : "";
+        const imgName = tex.name || tex.image?.name;
+
+        if (userSetName) nameEl.textContent = userSetName;
+        else if (imgName) nameEl.textContent = imgName;
+        else nameEl.textContent = "(embedded)";
+      } else {
+        nameEl.textContent = "(none)";
+      }
+    };
+
+    slots.forEach(s => {
+      applyThumb(mat[s.key], s.el, s.nameEl, s.stateKey, ({baseColor:'baseColorTex',metalness:'metalnessTex',roughness:'roughnessTex',normal:'normalTex',ao:'aoTex',emission:'emisTex',clearcoat:'clearcoatTex',clearcoatRoughness:'clearcoatRoughnessTex'}[s.stateKey]||null));
+    });
+
+    // Specular (specularIntensityMap)
+    let specTex = null;
+    if ("specularIntensityMap" in mat) specTex = mat.specularIntensityMap;
+    applyThumb(specTex, ui.thumbS, ui.nameS, "specularF0", "specTex");
+  }
+
+  function setEmbeddedNamesIfEmpty(m){
+    const ms = getOrCreateMatState(m.uuid);
+
+    const imgName = (tex)=>{
+      const n = tex?.image?.name || tex?.name;
+      return (n && String(n).trim()) ? String(n).trim() : "(embedded)";
+    };
+
+    if (!ms.metalness.name && m.metalnessMap) ms.metalness.name = imgName(m.metalnessMap);
+    if (!ms.roughness.name && m.roughnessMap) ms.roughness.name = imgName(m.roughnessMap);
+    if (!ms.normal.name && m.normalMap) ms.normal.name = imgName(m.normalMap);
+    if (!ms.ao.name && m.aoMap) ms.ao.name = imgName(m.aoMap);
+    if (!ms.emission.name && m.emissiveMap) ms.emission.name = imgName(m.emissiveMap);
+
+    if (!ms.specularF0.name && ("specularIntensityMap" in m) && m.specularIntensityMap){
+      ms.specularF0.name = imgName(m.specularIntensityMap);
+    }
+  }
+
+  function rebuildMaterialTargetList(){
+    ensureStateRoot();
+    ui.matTarget.innerHTML = "";
+
+    const root = model.currentModel;
+    if (!root){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no model)";
+      ui.matTarget.appendChild(opt);
+      ui.matTarget.value = "";
+      updateThumbnails(null);
+      return;
+    }
+
+    // Detect + prepare FBX once (normals + keep embedded maps)
+    runtime.fbxPrepared = false;
+    prepareFBXIfNeeded();
+
+    // Ensure PBR materials first (and keep thereafter)
+    ensureAllMaterialsArePBR();
+
+    // Ensure uv2 for ALL meshes (uv2が無い場合はuvを複製)
+    root.traverse(o=>{
+      if (!o.isMesh) return;
+
+      if (o.geometry?.attributes?.color){
+        o.geometry.deleteAttribute("color");
+        o.geometry.attributesNeedUpdate = true;
+      }
+
+      ensureUV2(o);
+    });
+
+    const mats = collectMaterialsInModel(root);
+    if (!mats.length){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no material)";
+      ui.matTarget.appendChild(opt);
+      ui.matTarget.value = "";
+      updateThumbnails(null);
+      return;
+    }
+
+    for (const m of mats){
+      const opt = document.createElement("option");
+      opt.value = m.uuid;
+      const n = (m.name && m.name.trim()) ? m.name.trim() : "(unnamed)";
+      opt.textContent = `${n}  [${m.type}]`;
+      ui.matTarget.appendChild(opt);
+
+      // capture expected UV transform for baseColor from current map (embedded)
+      if (m.map){
+        const p = cloneTexParamsFrom(m.map);
+        if (p) setExpectedParams(m.uuid, "baseColor", p);
+      }
+
+      // snapshot original maps (kept; remove is not used now)
+      const orig = getOrCreateOrigMaps(m.uuid);
+      if (orig.baseColor == null) orig.baseColor = m.map || null;
+      if (orig.metalness == null) orig.metalness = m.metalnessMap || null;
+      if (orig.roughness == null) orig.roughness = m.roughnessMap || null;
+      if (orig.normal == null) orig.normal = m.normalMap || null;
+      if (orig.ao == null) orig.ao = m.aoMap || null;
+      if (orig.emission == null) orig.emission = m.emissiveMap || null;
+      if (orig.specularF0 == null) orig.specularF0 = (("specularIntensityMap" in m) ? m.specularIntensityMap : null);
+
+      // Ensure defaults exist
+      getOrCreateMatState(m.uuid);
+
+      // UI表示改善: embedded map の name を埋める
+      setEmbeddedNamesIfEmpty(m);
+    }
+
+    const prev = state.material.selectedUuid;
+    const hasPrev = prev && mats.some(m=> m.uuid === prev);
+    ui.matTarget.value = hasPrev ? prev : mats[0].uuid;
+    state.material.selectedUuid = ui.matTarget.value;
+
+    getOrCreateMatState(ui.matTarget.value);
+    getOrCreateRuntimeTex(ui.matTarget.value);
+    getOrCreateTouched(ui.matTarget.value);
+    getOrCreateOrigMaps(ui.matTarget.value);
+
+    syncUIFromState();
+    updateThumbnails(getSelectedMaterial());
+  }
+
+  function syncUIFromState(){
+    ensureStateRoot();
+    const uuid = ui.matTarget.value || "";
+    if (!uuid) return;
+
+    const ms = getOrCreateMatState(uuid);
+
+    // BaseColor flipY UI reflects current texture if present
+    const mat = getSelectedMaterial();
+    if (ui.chkBCFlipY){
+      if (mat && mat.map){
+        ui.chkBCFlipY.checked = !!mat.map.flipY;
+      } else if (typeof ms.baseColor.flipYOverride === "boolean"){
+        ui.chkBCFlipY.checked = ms.baseColor.flipYOverride;
+      } else {
+        ui.chkBCFlipY.checked = false;
+      }
+    }
+
+    // Names are handled in updateThumbnails based on actual texture presence
+    ui.slM.value = String(ms.metalness.strength ?? 0.0);
+    ui.numM.value = _num2(ms.metalness.strength ?? 0.0);
+
+    ui.slR.value = String(ms.roughness.strength ?? 1.0);
+    ui.numR.value = _num2(ms.roughness.strength ?? 1.0);
+
+    ui.slS.value = String(ms.specularF0.strength ?? 0.5);
+    ui.numS.value = _num2(ms.specularF0.strength ?? 0.5);
+
+    ui.slN.value = String(ms.normal.strength ?? 0.0);
+    ui.numN.value = _num2(ms.normal.strength ?? 0.0);
+    ui.chkFlipG.checked = !!ms.normal.flipGreen;
+
+    ui.slAO.value = String(ms.ao.strength ?? 0.0);
+    ui.numAO.value = _num2(ms.ao.strength ?? 0.0);
+
+    ui.slE.value = String(ms.emission.strength ?? 0.0);
+    ui.numE.value = _num2(ms.emission.strength ?? 0.0);
+
+    ui.slCC.value = String(ms.clearcoat?.strength ?? 0.0);
+    ui.numCC.value = _num2(ms.clearcoat?.strength ?? 0.0);
+
+    ui.slCCR.value = String(ms.clearcoatRoughness?.strength ?? 0.0);
+    ui.numCCR.value = _num2(ms.clearcoatRoughness?.strength ?? 0.0);
+  }
+
+  function refreshEnabled(){
+    const enabled = isPBRLit();
+    setUIEnabled(enabled);
+    updateGateHint();
+  }
+
+  // -----------------------------
+  // Import handlers
+  // -----------------------------
+  function openTexPicker(kind){
+    pendingKind = kind;
+    texInput.value = "";
+    texInput.click();
+  }
+
+  async function handleTexPicked(file){
+    if (!file || !pendingKind) return;
+    ensureStateRoot();
+
+    updateModelFormatFlags();
+
+    const uuid0 = ui.matTarget.value || "";
+    if (!uuid0) return;
+
+    let mat = getSelectedMaterial();
+    if (!mat) return;
+
+    // Always ensure selected mat is Physical (PBR baseline)
+    mat = ensureStandardForMR(mat);
+    mat = ensurePhysicalForSpec(mat);
+
+    // IMPORTANT: uuid may change by ensure*; refresh buckets by current uuid
+    const uuid = mat.uuid;
+    if (uuid !== uuid0){
+      ui.matTarget.value = uuid;
+      state.material.selectedUuid = uuid;
+    }
+
+    let ms = getOrCreateMatState(uuid);
+    let rt = getOrCreateRuntimeTex(uuid);
+    let touched = getOrCreateTouched(uuid);
+
+    // capture expected params for baseColor from embedded/current map
+    if (pendingKind === "baseColor"){
+      const p = getOrCaptureExpectedParams(mat, uuid, "baseColor");
+      if (p) setExpectedParams(uuid, "baseColor", p);
+    }
+
+    const setTex = async (slotKey, texKey, colorKind, expectedSlot)=>{
+      disposeTex(rt[texKey]);
+      if (slotKey === "baseColor"){
+        revokePreviewUrl(uuid);
+      }
+
+      const expected = expectedSlot ? getOrCaptureExpectedParams(mat, uuid, expectedSlot) : null;
+      const loaded = await loadTextureFromFile(file, colorKind, expected);
+
+      rt[texKey] = loaded.tex;
+      // If user has chosen a flipY override for BaseColor, apply it to newly loaded texture
+      if (slotKey === "baseColor" && typeof ms.baseColor.flipYOverride === "boolean"){
+        rt[texKey].flipY = ms.baseColor.flipYOverride;
+        rt[texKey].needsUpdate = true;
+      }
+      ms[slotKey].name = file.name;
+
+      if (slotKey === "baseColor"){
+        runtime.previewUrlByMat.set(uuid, { url: loaded.urlForPreview });
+        touched.baseColorWasUserSet = true;
+      } else {
+        try{ URL.revokeObjectURL(loaded.urlForPreview); }catch(_){}
+      }
+    };
+
+    try{
+      if (pendingKind === "baseColor"){
+        await setTex("baseColor", "baseColorTex", "srgb", "baseColor");
+      } else if (pendingKind === "metalness"){
+        await setTex("metalness", "metalnessTex", "data", "metalness");
+      } else if (pendingKind === "roughness"){
+        await setTex("roughness", "roughnessTex", "data", "roughness");
+      } else if (pendingKind === "specularF0"){
+        await setTex("specularF0", "specTex", "data", "specularF0");
+      } else if (pendingKind === "normal"){
+        await setTex("normal", "normalTex", "data", "normal");
+      } else if (pendingKind === "ao"){
+        await setTex("ao", "aoTex", "data", "ao");
+      } else if (pendingKind === "emission"){
+        await setTex("emission", "emisTex", "srgb", "emission");
+      } else if (pendingKind === "clearcoat"){
+        await setTex("clearcoat", "clearcoatTex", "data", "clearcoat");
+      } else if (pendingKind === "clearcoatRoughness"){
+        await setTex("clearcoatRoughness", "clearcoatRoughnessTex", "data", "clearcoatRoughness");
+      }
+    } finally {
+      pendingKind = null;
+    }
+
+    syncUIFromState();
+    applySelected();
+    updateThumbnails(getSelectedMaterial());
+  }
+
+  texInput.addEventListener("change", async (e)=>{
+    const f = (e.target.files && e.target.files[0]) ? e.target.files[0] : null;
+    e.target.value = "";
+    if (!f) return;
+    try{
+      await handleTexPicked(f);
+    } catch(err){
+      console.error(err);
+      alert("Texture読み込み失敗: " + (err?.message || err));
+      pendingKind = null;
+    }
+  });
+
+  // -----------------------------
+  // Wiring
+  // -----------------------------
+  ensureStateRoot();
+  refreshEnabled();
+
+  ui.matTarget.addEventListener("change", ()=>{
+ensureStateRoot();
+    state.material.selectedUuid = ui.matTarget.value;
+
+    getOrCreateMatState(ui.matTarget.value);
+    getOrCreateRuntimeTex(ui.matTarget.value);
+    getOrCreateTouched(ui.matTarget.value);
+    getOrCreateOrigMaps(ui.matTarget.value);
+
+    syncUIFromState();
+    updateThumbnails(getSelectedMaterial());
+    // DO NOT applySelected() here
+  });
+
+  ui.btnApplyAll.addEventListener("click", ()=>{
+    applyAllFromSelected();
+  });
+
+  // BaseColor FlipY toggle (works for embedded and imported textures)
+  ui.chkBCFlipY.addEventListener("change", ()=>{
+    const uuid = ui.matTarget.value; if (!uuid) return;
+    const ms = getOrCreateMatState(uuid);
+    const mat = getSelectedMaterial();
+    const v = !!ui.chkBCFlipY.checked;
+    ms.baseColor.flipYOverride = v;
+
+    // Apply immediately to the currently assigned map (embedded or imported)
+    if (mat && mat.map){
+      mat.map.flipY = v;
+      mat.map.needsUpdate = true;
+      // keep expected params in sync so future replacements inherit
+      const p = cloneTexParamsFrom(mat.map);
+      if (p) setExpectedParams(uuid, "baseColor", p);
+    }
+
+    applySelected();
+  });
+// Import buttons
+  ui.btnBC.addEventListener("click", ()=> openTexPicker("baseColor"));
+  ui.btnM.addEventListener("click",  ()=> openTexPicker("metalness"));
+  ui.btnS.addEventListener("click",  ()=> openTexPicker("specularF0"));
+  ui.btnR.addEventListener("click",  ()=> openTexPicker("roughness"));
+  ui.btnN.addEventListener("click",  ()=> openTexPicker("normal"));
+  ui.btnAO.addEventListener("click", ()=> openTexPicker("ao"));
+  ui.btnE.addEventListener("click",  ()=> openTexPicker("emission"));
+  ui.btnCC.addEventListener("click",  ()=> openTexPicker("clearcoat"));
+  ui.btnCCR.addEventListener("click", ()=> openTexPicker("clearcoatRoughness"));
+
+  // -----------------------------
+  // Remove texture
+  // -----------------------------
+  function removeTexture(slotKey, texKey, matSlotKey){
+    const uuid = ui.matTarget.value; if (!uuid) return;
+    const ms = getOrCreateMatState(uuid);
+    const rt = getOrCreateRuntimeTex(uuid);
+    const mat = getSelectedMaterial();
+
+    // Dispose and clear runtime texture
+    disposeTex(rt[texKey]);
+    rt[texKey] = null;
+
+    // Clear state name
+    if (ms[slotKey]) ms[slotKey].name = "";
+
+    // Special cleanup for baseColor preview URL
+    if (slotKey === "baseColor") revokePreviewUrl(uuid);
+
+    // Null out the material slot directly
+    if (mat && matSlotKey in mat){
+      mat[matSlotKey] = null;
+      mat.needsUpdate = true;
+    }
+
+    applySelected();
+    updateThumbnails(getSelectedMaterial());
+  }
+
+  ui.btnRmBC.addEventListener("click",  ()=> removeTexture("baseColor",          "baseColorTex",          "map"));
+  ui.btnRmM.addEventListener("click",   ()=> removeTexture("metalness",          "metalnessTex",          "metalnessMap"));
+  ui.btnRmS.addEventListener("click",   ()=> removeTexture("specularF0",         "specTex",               "specularIntensityMap"));
+  ui.btnRmR.addEventListener("click",   ()=> removeTexture("roughness",          "roughnessTex",          "roughnessMap"));
+  ui.btnRmN.addEventListener("click",   ()=> removeTexture("normal",             "normalTex",             "normalMap"));
+  ui.btnRmAO.addEventListener("click",  ()=> removeTexture("ao",                 "aoTex",                 "aoMap"));
+  ui.btnRmE.addEventListener("click",   ()=> removeTexture("emission",           "emisTex",               "emissiveMap"));
+  ui.btnRmCC.addEventListener("click",  ()=> removeTexture("clearcoat",          "clearcoatTex",          "clearcoatMap"));
+  ui.btnRmCCR.addEventListener("click", ()=> removeTexture("clearcoatRoughness", "clearcoatRoughnessTex", "clearcoatRoughnessMap"));
+
+  // Bind all Strength sliders with number inputs
+  bindRangeAndNumber({
+    rangeEl: ui.slM, numEl: ui.numM,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.metalness.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slR, numEl: ui.numR,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.roughness.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slS, numEl: ui.numS,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.specularF0.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slN, numEl: ui.numN,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.normal.strength = v;
+      applySelected();
+    }
+  });
+
+  ui.chkFlipG.addEventListener("change", ()=>{
+    const uuid = ui.matTarget.value; if (!uuid) return;
+    const ms = getOrCreateMatState(uuid);
+    ms.normal.flipGreen = !!ui.chkFlipG.checked;
+    applySelected();
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slAO, numEl: ui.numAO,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.ao.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slE, numEl: ui.numE,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      ms.emission.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slCC, numEl: ui.numCC,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      if (!ms.clearcoat) ms.clearcoat = { name: "", strength: 0.0 };
+      ms.clearcoat.strength = v;
+      applySelected();
+    }
+  });
+
+  bindRangeAndNumber({
+    rangeEl: ui.slCCR, numEl: ui.numCCR,
+    onValue: (v)=>{
+      const uuid = ui.matTarget.value; if (!uuid) return;
+      const ms = getOrCreateMatState(uuid);
+      if (!ms.clearcoatRoughness) ms.clearcoatRoughness = { name: "", strength: 0.0 };
+      ms.clearcoatRoughness.strength = v;
+      applySelected();
+    }
+  });
+
+  // Events from viewer
+  on("model-loaded", ()=>{
+    runtime.fbxPrepared = false;
+    prepareFBXIfNeeded();
+    rebuildMaterialTargetList();
+    refreshEnabled();
+  });
+
+  on("model-cleared", ()=>{
+    runtime.modelIsFBX = false;
+    runtime.fbxPrepared = false;
+    refreshEnabled();
+    rebuildMaterialTargetList();
+  });
+
+  on("state-changed", ()=>{
+    refreshEnabled();
+    updateThumbnails(getSelectedMaterial());
+  });
+
+  // Export module API
+  viewer.modules.material = {
+    rebuildMaterialTargetList,
+    applySelected,
+    refreshEnabled,
+  };
+
+  // init (in case model already exists)
+  rebuildMaterialTargetList();
+  refreshEnabled();
+}
+</script>
+</body>
+</html>
